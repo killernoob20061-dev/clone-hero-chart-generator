@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+dataset/
+processed/
+checkpoints/
+*.pt
+*.pth
+*.opus
+*.mp3
+*.wav
+*.ogg
+*.zip
+*.rar
