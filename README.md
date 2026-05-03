@@ -15,7 +15,7 @@ Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo
 - 🥁 **Kick & snare awareness** — kick hits anchor fret position (grounded feel), snare hits accent upward
 - 🎚️ **Intensity curve** — loud sections get denser notes and wider fret jumps; quiet sections get sparse, sustained notes
 - 🎼 **Bass root anchoring** — bass pitch changes trigger a return to the lowest fret (chord root feel)
-- 🤖 **Optional neural model** — train ChartNet on real charts for human-level note placement
+- 🤖 **Neural model (ChartNet v2, ~35M params)** — predicts note placement, fret, sustain length, chords, and note type (HOPO/tap/open strum) all in one shot
 
 ## Requirements
 
@@ -94,12 +94,12 @@ Downloads chart+audio pairs from [Enchor](https://enchor.us) (Chorus Encore). Ea
 python preprocess_dataset.py --data ./dataset --out ./processed
 ```
 
-### Step 3 — Train (4–8h on RTX 3090)
+### Step 3 — Train (6–12h on RTX 3090)
 ```bash
 python train_chartnet.py --data ./processed --out ./checkpoints --epochs 60
 ```
 
-Saves `checkpoints/best.pt` (best validation note F1).
+Saves `checkpoints/best.pt` (best validation note F1). If you run out of VRAM, reduce batch size: `--batch 16`.
 
 ### Step 4 — Use it
 ```bash

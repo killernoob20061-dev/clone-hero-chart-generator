@@ -1383,30 +1383,61 @@ def _mel_for_chartnet(y, sr, beat_times, n_mels=128, hop_length=512):
 
 def chartnet_notes(y, sr, beat_times, tps, diff, solo_tick_set, fret_pool=None):
     """
-    Use trained ChartNet to predict note positions + frets.
-    ChartNet outputs fret indices 0..N; we remap through fret_pool.
-    Falls back gracefully if model not loaded.
-    Returns list of (tick, fret, 0) or None.
+    Use trained ChartNet v2 to predict full note events.
+    Returns list of (tick, fret, sustain) with chord notes interleaved,
+    or None if model not loaded / inference fails.
+
+    ChartNet v2 predicts per grid position:
+      fret     (0-4)  → remapped through fret_pool
+      sustain  bucket (0-3) → converted to ticks
+      chord    (0-4 or -1=none) → adds a second simultaneous note
+      type     (0=normal, 1=HOPO, 2=tap, 3=open) → written as fret 5/6/7
     """
     if fret_pool is None:
         fret_pool = [0, 1, 2]
     if _chartnet_model is None:
         return None
+
+    # Sustain bucket → approximate tick length
+    SUSTAIN_TICKS = {0: 0, 1: QTR//2, 2: QTR, 3: BEAT*2}
+
     try:
         mel, grid_times = _mel_for_chartnet(y, sr, beat_times)
         raw = predict_chart(_chartnet_model, mel, diff, device=_chartnet_device)
         notes = []
         max_idx = len(fret_pool) - 1
-        for grid_pos, fret_idx in raw:
-            if grid_pos >= len(grid_times):
+
+        for ev in raw:
+            gp = ev['grid_pos']
+            if gp >= len(grid_times):
                 continue
-            tick = snap(t2tick(grid_times[grid_pos], tps), QTR)
+            tick = snap(t2tick(grid_times[gp], tps), QTR)
             if tick in solo_tick_set:
                 continue
-            # Remap model's fret index (trained on 0-2) → active fret pool
-            mapped = fret_pool[min(fret_idx, max_idx)]
-            notes.append((tick, mapped, 0))
-        return sorted(notes, key=lambda x: x[0]) if notes else None
+
+            # Remap fret through active pool
+            mapped_fret = fret_pool[min(ev['fret'], max_idx)]
+            sustain     = SUSTAIN_TICKS.get(ev['sustain'], 0)
+            ntype       = ev['type']
+
+            # Note type → Clone Hero special fret numbers
+            if ntype == 2:     # tap
+                notes.append((tick, 6, 0))
+            elif ntype == 3:   # open strum
+                notes.append((tick, 7, sustain))
+            else:
+                if ntype == 1:     # HOPO flag
+                    notes.append((tick, 5, 0))
+                notes.append((tick, mapped_fret, sustain))
+
+                # Chord: add second note if model predicted one
+                chord_idx = ev.get('chord', -1)
+                if chord_idx >= 0:
+                    chord_fret = fret_pool[min(chord_idx, max_idx)]
+                    if chord_fret != mapped_fret:
+                        notes.append((tick, chord_fret, sustain))
+
+        return sorted(notes, key=lambda x: (x[0], x[1])) if notes else None
     except Exception as e:
         print(f'  [warn] ChartNet inference failed ({e}), using algorithmic fallback')
         return None
