@@ -109,13 +109,16 @@ def load_and_separate(mp3_path):
     y   = rs(y_mix.mean(0))
     yg  = rs(stems.get('other'))
     yp  = rs(stems.get('drums'))
+    yb  = rs(stems.get('bass'))      # bass stem — used for chord root anchoring
     if yg is None or np.abs(yg).max() < 1e-4:
         yg, yph = librosa.effects.hpss(y, margin=3.0)
         if yp is None: yp = yph
     if yp is None:
         _, yp = librosa.effects.hpss(y, margin=3.0)
+    if yb is None:
+        yb = np.zeros_like(y)
     dur = librosa.get_duration(y=y, sr=SR)
-    return y, yg, yp, SR, dur
+    return y, yg, yp, yb, SR, dur
 
 # ── Genre detection ──────────────────────────────────────────────────────────
 
@@ -208,6 +211,85 @@ def get_onsets(y, y_perc, sr, tps, mp3_path):
     o2 = librosa.onset.onset_detect(y=y,      sr=sr, units='frames', delta=0.025, backtrack=True)
     times = librosa.frames_to_time(np.union1d(o1, o2), sr=sr)
     return sorted(set(snap(t2tick(t, tps), QTR) for t in times))
+
+# ── Intensity curve ───────────────────────────────────────────────────────────
+
+def build_intensity_curve(y, sr, beat_times, tps):
+    """
+    Per-beat intensity score (0.0–1.0) based on RMS energy of the full mix.
+    Used to scale note density, sustain length, and fret jump range dynamically.
+    Returns dict: beat_tick → intensity (float 0..1)
+    """
+    hop  = 512
+    rms  = librosa.feature.rms(y=y, hop_length=hop)[0]
+    # Smooth with a 3-beat window to avoid single-frame spikes
+    rms_s = sp_medfilt(rms.astype(float), size=max(3, int(sr * 0.1 / hop) | 1))
+    rms_max = rms_s.max() + 1e-8
+
+    intensity = {}
+    for bt in beat_times:
+        frame = min(int(librosa.time_to_frames(bt, sr=sr, hop_length=hop)), len(rms_s)-1)
+        tick  = snap(t2tick(bt, tps), BEAT)
+        intensity[tick] = float(rms_s[frame]) / rms_max
+    return intensity
+
+# ── Kick / snare separation ───────────────────────────────────────────────────
+
+def build_drum_maps(y_perc, sr, tps):
+    """
+    Separate kick (low) and snare (mid) onsets from the drum stem.
+    Returns:
+      kick_ticks  — set of ticks where kick drum fires  (anchor note placement)
+      snare_ticks — set of ticks where snare fires      (beat 2 & 4 weight)
+    """
+    hop = 512
+    # Low-pass for kick (~20–180 Hz), band-pass for snare (~180–5000 Hz)
+    S     = np.abs(librosa.stft(y_perc, n_fft=2048, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+
+    kick_mask  = freqs <= 180
+    snare_mask = (freqs > 180) & (freqs <= 5000)
+
+    kick_signal  = S[kick_mask].sum(0)
+    snare_signal = S[snare_mask].sum(0)
+
+    def _onsets_from_signal(sig):
+        # Normalise and run onset on the filtered energy envelope
+        sig_n = sig / (sig.max() + 1e-8)
+        frames = librosa.onset.onset_detect(
+            onset_envelope=sig_n, sr=sr, hop_length=hop,
+            delta=0.1, backtrack=True)
+        times = librosa.frames_to_time(frames, sr=sr, hop_length=hop)
+        return set(snap(t2tick(t, tps), QTR) for t in times)
+
+    kick_ticks  = _onsets_from_signal(kick_signal)
+    snare_ticks = _onsets_from_signal(snare_signal)
+    return kick_ticks, snare_ticks
+
+# ── Bass pitch map for chord root anchoring ───────────────────────────────────
+
+def build_bass_root_map(y_bass, sr, tps):
+    """
+    Track the bass pitch per tick to identify chord roots.
+    Returns dict: tick → bass_midi (float, 0 if unvoiced).
+    The fret assigner uses this to prefer the lowest pool fret at root changes.
+    """
+    hop = 512
+    f0, voiced, vprob = librosa.pyin(
+        y_bass, sr=sr,
+        fmin=librosa.note_to_hz('B0'), fmax=librosa.note_to_hz('G3'),
+        frame_length=2048, hop_length=hop, fill_na=0.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        midi = np.where(voiced & (f0 > 0) & (vprob >= 0.3),
+                        12*np.log2(np.maximum(f0, 1e-6)/440)+69, 0.0)
+    midi_s = sp_medfilt(midi, size=5)
+
+    def bass_at(tick):
+        t_s   = tick / tps
+        frame = max(0, min(int(round(t_s * sr / hop)), len(midi_s)-1))
+        return float(midi_s[frame])
+
+    return bass_at
 
 # ── Pitch map (pyin) ──────────────────────────────────────────────────────────
 
@@ -620,12 +702,26 @@ def _assign_rock(ticks, contour, max_idx, dbb, tps):
         prev_dir=f-prev if prev>=0 else 0; prev=f; frets.append(f)
     return frets
 
-def assign_frets_genre(ticks, fret_at, genre, dbb, tps, bpm=120, fret_pool=None):
-    """Assign frets using genre patterns, then remap through fret_pool."""
+def assign_frets_genre(ticks, fret_at, genre, dbb, tps, bpm=120, fret_pool=None,
+                       intensity=None, bass_at=None, kick_ticks=None, snare_ticks=None):
+    """
+    Assign frets using genre patterns, then remap through fret_pool.
+    intensity  — dict tick→float(0..1): loud sections allow wider fret jumps
+    bass_at    — callable tick→midi: bass root anchors lowest fret at chord changes
+    kick_ticks — set: kick hits snap to current base fret (steady, grounded feel)
+    snare_ticks— set: snare hits nudge up one index (accentuate the backbeat)
+    """
     if fret_pool is None:
         fret_pool = [0, 1, 2]
+    if intensity is None:
+        intensity = {}
+    if kick_ticks is None:
+        kick_ticks = set()
+    if snare_ticks is None:
+        snare_ticks = set()
     if not ticks:
         return []
+
     max_idx = len(fret_pool) - 1
     raw_contour = np.array([fret_at(t) for t in ticks], dtype=float)
     contour = _pool_contour(raw_contour, len(fret_pool))
@@ -634,6 +730,39 @@ def assign_frets_genre(ticks, fret_at, genre, dbb, tps, bpm=120, fret_pool=None)
     elif genre == 'electronic': indices = _assign_electronic(ticks, contour, max_idx, bpm)
     elif genre == 'pop':        indices = _assign_pop(ticks, contour, max_idx)
     else:                       indices = _assign_rock(ticks, contour, max_idx, dbb, tps)
+
+    # ── Post-pass: intensity-driven jump expansion ─────────────────────────
+    # In loud sections (intensity > 0.7) allow jumps up to 3; quiet < 0.3 → max 1
+    for i in range(1, len(indices)):
+        t    = ticks[i]
+        lvl  = intensity.get(snap(t, BEAT), 0.5)
+        max_jump = 1 if lvl < 0.3 else (3 if lvl > 0.7 else 2)
+        if abs(indices[i] - indices[i-1]) > max_jump:
+            indices[i] = indices[i-1] + (max_jump if indices[i] > indices[i-1] else -max_jump)
+            indices[i] = max(0, min(max_idx, indices[i]))
+
+    # ── Bass root anchoring ────────────────────────────────────────────────
+    # When the bass note changes significantly, snap to index 0 (lowest fret)
+    if bass_at is not None:
+        prev_bass = None
+        for i, t in enumerate(ticks):
+            bm = bass_at(t)
+            if bm > 0:
+                if prev_bass is not None and abs(bm - prev_bass) >= 2.0:
+                    # Root note change → anchor to lowest pool fret
+                    indices[i] = 0
+                prev_bass = bm
+
+    # ── Kick / snare adjustments ───────────────────────────────────────────
+    for i, t in enumerate(ticks):
+        if t in kick_ticks:
+            # Kick: hold current index (grounding effect — no jump on kick)
+            if i > 0:
+                indices[i] = indices[i-1]
+        elif t in snare_ticks and max_idx > 0:
+            # Snare: nudge one step up for a backbeat accent
+            indices[i] = min(indices[i] + 1, max_idx)
+
     indices = _ergonomic(indices, max_idx)
     # Remap index → actual fret number
     return [(ticks[i], fret_pool[indices[i]], 0) for i in range(len(ticks))]
@@ -683,8 +812,13 @@ def _replicate_phrases(by_sec, tmap, sticks):
 
 # ── Sustains ──────────────────────────────────────────────────────────────────
 
-def add_sustains(notes, target_pct):
+def add_sustains(notes, target_pct, intensity=None):
+    """
+    Add sustains to notes. Intense sections get shorter sustains (staccato attack),
+    quiet sections get longer holds (smooth, melodic feel).
+    """
     if not notes: return notes
+    if intensity is None: intensity = {}
     notes = sorted(notes, key=lambda x: x[0])
     tl    = [t for t,_,_ in notes]
     res   = []
@@ -693,6 +827,13 @@ def add_sustains(notes, target_pct):
         sus = (gap-QTR  if gap>=BEAT*2 else
                gap-QTR  if gap>=BEAT   else
                gap-EGTH if gap>=HALF   else 0)
+        # Intensity modulation: loud → shorten sustain (punchy), quiet → extend
+        if sus > 0 and intensity:
+            lvl = intensity.get(snap(t, BEAT), 0.5)
+            # loud (>0.7): cut sustain by up to 40%; quiet (<0.3): extend by 20%
+            if   lvl > 0.7: sus = int(sus * (1.0 - 0.4 * (lvl - 0.7) / 0.3))
+            elif lvl < 0.3: sus = int(sus * (1.0 + 0.2 * (0.3 - lvl) / 0.3))
+            sus = max(0, sus)
         res.append((t,f,sus))
     si  = [i for i,(_,_,s) in enumerate(res) if s>0]
     act = len(si)/max(len(res),1)
@@ -737,20 +878,25 @@ def add_chords(notes, beat_ticks, dbb, diff, chord_guide=None, fret_pool=None):
 # ── Note importance ranking ──────────────────────────────────────────────────
 
 def rank_onset_importance(onset_ticks, beat_times, tps, y, y_guit, sr,
-                           chord_guide, fret_at):
+                           chord_guide, fret_at,
+                           kick_ticks=None, snare_ticks=None):
     """
     Score every detected onset 0–1 by musical importance.
     Human charters keep the most important notes; this replaces blind subsampling.
 
     Scoring factors:
-      beat_strength   (0.30) — downbeat > beat > offbeat
-      onset_strength  (0.25) — how strong the attack is
-      energy          (0.20) — RMS at that moment
-      harmonic_weight (0.15) — is this onset a chord root / strong chroma peak?
-      melodic_peak    (0.10) — local maximum in the pitch contour?
+      beat_strength   (0.25) — downbeat > beat > offbeat
+      drum_anchor     (0.20) — kick/snare hit coincides with this onset
+      onset_strength  (0.20) — how strong the attack is
+      energy          (0.15) — RMS at that moment
+      harmonic_weight (0.12) — is this onset a chord root / strong chroma peak?
+      melodic_peak    (0.08) — local maximum in the pitch contour?
     """
     if not onset_ticks:
         return {}
+
+    kick_ticks  = kick_ticks  or set()
+    snare_ticks = snare_ticks or set()
 
     hop = 512
     # Pre-compute per-frame features
@@ -784,25 +930,30 @@ def rank_onset_importance(onset_ticks, beat_times, tps, y, y_guit, sr,
         elif tick in half_tick_set:  bs = 0.6
         else:                        bs = 0.2
 
-        # 2. Onset strength (normalised)
+        # 2. Drum anchor — kick scores highest (strong downbeat hit), snare good too
+        if   tick in kick_ticks:   da = 1.0
+        elif tick in snare_ticks:  da = 0.7
+        else:                      da = 0.0
+
+        # 3. Onset strength (normalised)
         os_val = float(oe[frame]) / (float(oe.max()) + 1e-8)
 
-        # 3. Energy
+        # 4. Energy
         en_val = float(rms[min(frame, len(rms)-1)]) / (float(rms.max()) + 1e-8)
 
-        # 4. Harmonic weight — how "peaked" is the chroma at this frame?
+        # 5. Harmonic weight — how "peaked" is the chroma at this frame?
         col    = chroma[:, min(frame, chroma.shape[1]-1)]
         peak   = float(col.max())
         mean_c = float(col.mean())
-        hw     = (peak - mean_c) / (peak + 1e-8)   # 1.0 = pure single pitch
+        hw     = (peak - mean_c) / (peak + 1e-8)
 
-        # 5. Melodic peak — local max in pitch contour?
+        # 6. Melodic peak — local max in pitch contour?
         lo = max(0, frame-3); hi = min(len(midi), frame+4)
         window = midi[lo:hi]
         mp = 1.0 if (len(window) > 0 and midi[frame] == window.max()
                      and midi[frame] > 0) else 0.0
 
-        score = (0.30*bs + 0.25*os_val + 0.20*en_val + 0.15*hw + 0.10*mp)
+        score = (0.25*bs + 0.20*da + 0.20*os_val + 0.15*en_val + 0.12*hw + 0.08*mp)
         scores[tick] = float(score)
 
     return scores
@@ -932,10 +1083,18 @@ def build_diff(diff, beats, eighths, sixteenths, onset_ticks,
                solo_regions, y_guit, y, sr,
                tmap=None, sticks=None, chord_guide=None,
                importance_scores=None, phrases=None, phrase_groups=None,
-               fret_pool=None):
+               fret_pool=None, intensity=None, kick_ticks=None,
+               snare_ticks=None, bass_at=None):
 
     if fret_pool is None:
         fret_pool = [0, 1, 2]
+    if intensity is None:
+        intensity = {}
+    if kick_ticks is None:
+        kick_ticks = set()
+    if snare_ticks is None:
+        snare_ticks = set()
+
     # Easy difficulty restricts to lower half of the fret pool
     easy_pool = fret_pool[:max(1, (len(fret_pool)+1)//2)]
     active_pool = easy_pool if diff == 'easy' else fret_pool
@@ -981,15 +1140,33 @@ def build_diff(diff, beats, eighths, sixteenths, onset_ticks,
                 if not (dbb.get(snap(t,BEAT),1.0) < 0.75
                         and np.random.random() > dbb.get(snap(t,BEAT),1.0))]
 
+    # ── Intensity-aware note target: dense sections get more notes ────────
+    # Boost/trim note_tgt per section based on local intensity
+    if intensity:
+        avg_intensity = float(np.mean(list(intensity.values()))) if intensity else 0.5
+        # Scale pool size: quiet sections → 70% of target, loud → 130%
+        intensity_scale = 0.70 + 0.60 * avg_intensity
+        note_tgt = int(note_tgt * intensity_scale)
+
+    # ── Kick-anchored boosting: kick hits must stay in pool ───────────────
+    # Even if importance ranking would cut them, keep kick-coincident ticks
+    kick_in_pool = set(t for t in pool if t in kick_ticks)
+
     # ── Importance-ranked note selection (replaces blind subsampling) ─────
     if importance_scores and len(pool) > note_tgt:
         pool = select_by_importance(pool, importance_scores, note_tgt, min_gap)
+        # Re-insert any lost kick hits (up to 5% of target)
+        for kt in sorted(kick_in_pool):
+            if kt not in pool and len(pool) < int(note_tgt * 1.05):
+                pool = sorted(pool + [kt])
     elif len(pool) > note_tgt:
         step = len(pool) / note_tgt
         pool = [pool[int(i*step)] for i in range(note_tgt)]
 
     # ── Genre fret assignment ─────────────────────────────────────────────
-    notes = assign_frets_genre(pool, fret_at, genre, dbb, tps, bpm, active_pool)
+    notes = assign_frets_genre(pool, fret_at, genre, dbb, tps, bpm, active_pool,
+                               intensity=intensity, bass_at=bass_at,
+                               kick_ticks=kick_ticks, snare_ticks=snare_ticks)
 
     # ── Phrase motif repetition (identical phrases → identical patterns) ──
     if phrases and phrase_groups:
@@ -1002,7 +1179,7 @@ def build_diff(diff, beats, eighths, sixteenths, onset_ticks,
         by_sec = _replicate_phrases(by_sec, tmap, sticks)
         notes  = sorted([n for s in by_sec.values() for n in s], key=lambda x:x[0])
 
-    notes = add_sustains(notes, sus_tgt)
+    notes = add_sustains(notes, sus_tgt, intensity=intensity)
 
     # ── Solo regions: note-for-note chart, merged in ───────────────────────
     solo_notes = []
@@ -1075,7 +1252,7 @@ def generate(mp3_path, fret_pool=None):
     except Exception: pass
 
     # ── Analysis pipeline ─────────────────────────────────────────────────
-    y, y_guit, y_perc, sr, duration = load_and_separate(mp3_path)
+    y, y_guit, y_perc, y_bass, sr, duration = load_and_separate(mp3_path)
     genre                            = detect_genre(y, sr)
     bpm, beat_times, bpm_events, _  = analyze_tempo(y_perc, sr, mp3_path)
     tps                              = (bpm/60.0)*RES
@@ -1093,17 +1270,28 @@ def generate(mp3_path, fret_pool=None):
     tmap, sticks               = detect_repeated_phrases(y, sr, tps)
     chord_guide                = build_chord_guide(y, y_guit, sr, tps, beats)
 
-    # v6 additions
+    # v7 additions — intensity, drums, bass
+    print('  Building intensity curve...')
+    intensity                  = build_intensity_curve(y, sr, beat_times, tps)
+    print('  Separating kick / snare...')
+    kick_ticks, snare_ticks    = build_drum_maps(y_perc, sr, tps)
+    print('  Bass pitch tracking...')
+    bass_at                    = build_bass_root_map(y_bass, sr, tps)
+
     print('  Ranking note importance...')
     importance_scores          = rank_onset_importance(
                                      onset_ticks, beat_times, tps,
-                                     y, y_guit, sr, chord_guide, fret_at)
+                                     y, y_guit, sr, chord_guide, fret_at,
+                                     kick_ticks=kick_ticks, snare_ticks=snare_ticks)
     print('  Building phrase map...')
     phrases, phrase_groups     = build_phrase_map(y, sr, beat_times, tps)
 
+    avg_int = float(np.mean(list(intensity.values()))) if intensity else 0.0
     print(f'  Sections={len(sec_events)}  SP={len(sp_events)}  '
           f'Onsets={len(onset_ticks)}  Solos={len(solo_regions)}  '
-          f'Phrases={len(phrases)} ({len(phrase_groups)} repeating)')
+          f'Phrases={len(phrases)} ({len(phrase_groups)} repeating)  '
+          f'Kicks={len(kick_ticks)}  Snares={len(snare_ticks)}  '
+          f'AvgIntensity={avg_int:.2f}')
 
     # ── Chart all difficulties ─────────────────────────────────────────────
     np.random.seed(42)
@@ -1116,7 +1304,9 @@ def generate(mp3_path, fret_pool=None):
             tmap=tmap, sticks=sticks, chord_guide=chord_guide,
             importance_scores=importance_scores,
             phrases=phrases, phrase_groups=phrase_groups,
-            fret_pool=fret_pool)
+            fret_pool=fret_pool, intensity=intensity,
+            kick_ticks=kick_ticks, snare_ticks=snare_ticks,
+            bass_at=bass_at)
         notes = add_chords(notes, beats, dbb, diff, chord_guide, fret_pool=fret_pool)
         diffs[diff] = notes
         ps = round(100*sum(1 for _,_,s in notes if s>0)/max(len(notes),1))

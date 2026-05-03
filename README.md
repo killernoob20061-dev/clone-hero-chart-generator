@@ -1,17 +1,20 @@
 # Clone Hero Chart Generator
 
-Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo detection, genre-aware patterns, configurable fret palette, and an optional trainable neural model.
+Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo detection, genre-aware patterns, intensity-driven dynamics, instrument-aware note placement, and an optional trainable neural model.
 
 ## Features
 
 - 🎸 **Guitar solo detection** — 5-signal detector (pyin voiced probability, spectral centroid, onset density, RMS, chroma peakiness). Solo regions are charted note-for-note at high resolution.
 - 🎵 **Genre detection** — metal / pop / electronic / rock each get a different pattern generation strategy
 - 🧠 **Phrase motif system** — repeated musical sections (chorus 1 ≈ chorus 2) get the **exact same** fret pattern
-- 📊 **Note importance ranking** — downbeats, chord roots, and melody peaks are kept; filler notes dropped
+- 📊 **Note importance ranking** — downbeats, chord roots, melody peaks, kick/snare hits all scored; filler notes dropped
 - 🔁 **SSM phrase replication** — Self-Similarity Matrix finds structurally similar sections
 - 🎤 **Lyrics** — Whisper large-v3 transcription with word-level timestamps
 - 🎯 **4 difficulties** — Easy / Medium / Hard / Expert, all calibrated from real chart analysis
 - 🎛️ **Configurable fret palette** — choose any subset of the 5 frets via `--frets`
+- 🥁 **Kick & snare awareness** — kick hits anchor fret position (grounded feel), snare hits accent upward
+- 🎚️ **Intensity curve** — loud sections get denser notes and wider fret jumps; quiet sections get sparse, sustained notes
+- 🎼 **Bass root anchoring** — bass pitch changes trigger a return to the lowest fret (chord root feel)
 - 🤖 **Optional neural model** — train ChartNet on real charts for human-level note placement
 
 ## Requirements
