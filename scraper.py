@@ -1,242 +1,235 @@
 """
-Clone Hero chart scraper — downloads chart+audio pairs from Enchor API.
+Clone Hero chart scraper — downloads chart+audio pairs from Enchor (Chorus Encore).
 Usage: python scraper.py --out ./dataset --limit 2000
 
-Targets: enchor.us  (the current main CH chart search engine, successor to Chorus)
-Saves each song as:  dataset/<id>/song.opus  +  dataset/<id>/notes.chart
-                     dataset/<id>/meta.json
+API:  POST https://api.enchor.us/search
+Download: https://files.enchor.us/{md5}.sng  (self-contained SNG archive)
+
+SNG files contain: notes.chart, song.opus/ogg/mp3, song.ini, album art etc.
+Saves each song as: dataset/<md5>/notes.chart + song.opus + meta.json
 """
 
-import os, sys, json, time, argparse, zipfile, re
+import os, sys, json, time, argparse, zipfile, struct, re
 import requests
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-try:
-    import rarfile
-    HAS_RAR = True
-except ImportError:
-    HAS_RAR = False
-
-# ── Config ────────────────────────────────────────────────────────────────────
-# Enchor API — successor to Chorus, currently active
-ENCHOR_API  = 'https://enchor.us/api/search'
-RATE_LIMIT  = 0.5     # seconds between API calls (be polite)
-TIMEOUT     = 40      # seconds per HTTP request
-MAX_WORKERS = 3       # parallel downloads
+# ── Config ─────────────────────────────────────────────────────────────────────
+API_URL     = 'https://api.enchor.us/search'
+DL_URL      = 'https://files.enchor.us/{md5}.sng'
+RATE_LIMIT  = 0.4
+TIMEOUT     = 40
+MAX_WORKERS = 4
 AUDIO_EXTS  = {'.opus', '.ogg', '.mp3', '.wav'}
-CHART_NAMES = {'notes.chart', 'notes.mid'}
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def safe_filename(s):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(s))[:80]
 
-def enchor_search(query='', page=1, per_page=20):
-    """Single page from the Enchor search API."""
-    params = {'query': query, 'page': page, 'per_page': per_page}
+def search_page(query='', page=1):
+    """POST one page to the Enchor search API."""
+    payload = {
+        'search': query, 'page': page,
+        'instrument': None, 'difficulty': None,
+        'drumType': None, 'drumsReviewed': False,
+        'source': 'website'
+    }
     try:
-        r = requests.get(ENCHOR_API, params=params, timeout=TIMEOUT,
-                         headers={'User-Agent': 'CloneHeroTrainer/1.0'})
+        r = requests.post(API_URL, json=payload, timeout=TIMEOUT,
+                          headers={'User-Agent': 'CloneHeroTrainer/1.0',
+                                   'Content-Type': 'application/json'})
         r.raise_for_status()
         data = r.json()
-        # Enchor returns {'songs': [...]} or a list directly
-        if isinstance(data, list):
-            return data
-        return data.get('songs', data.get('data', data.get('results', [])))
+        return data.get('data', [])
     except Exception as e:
-        print(f'  [warn] Enchor API page {page}: {e}')
+        print(f'  [warn] API page {page}: {e}')
         return []
 
 def iter_all_songs(limit=2000):
-    """Yield song dicts from Enchor until limit reached."""
+    """Yield song dicts until limit reached, paging through all results."""
     seen, page = set(), 1
     while len(seen) < limit:
-        songs = enchor_search(page=page)
+        songs = search_page(page=page)
         if not songs:
-            print(f'  No more results at page {page}')
             break
         for s in songs:
-            sid = str(s.get('id', s.get('md5', s.get('link', ''))))
-            if sid and sid not in seen:
-                seen.add(sid)
+            md5 = s.get('md5', '')
+            if md5 and md5 not in seen:
+                seen.add(md5)
                 yield s
                 if len(seen) >= limit:
                     return
+        print(f'  Page {page}: {len(seen)} songs so far')
         page += 1
         time.sleep(RATE_LIMIT)
 
-def find_download_url(song):
-    """Extract best direct download URL from an Enchor song dict."""
-    # Enchor uses 'link' or nested 'links' / 'directLinks'
-    for key in ('link', 'download', 'download_url'):
-        v = song.get(key, '')
-        if v and str(v).startswith('http'):
-            return str(v)
+# ── SNG parsing ────────────────────────────────────────────────────────────────
+# SNG is a simple container: 4-byte magic + file entries
+# Format per entry: [uint32 name_len][name][uint64 file_len][data]
+SNG_MAGIC = b'SNGPKG\0\0'
 
-    # Nested dicts
-    for key in ('links', 'directLinks', 'sources'):
-        dl = song.get(key, {})
-        if isinstance(dl, dict):
-            for pref in ('archive', 'drive', 'dropbox', 'direct', 'mediafire'):
-                if pref in dl and dl[pref]:
-                    return dl[pref]
-            for v in dl.values():
-                if v and str(v).startswith('http'):
-                    return str(v)
-        elif isinstance(dl, list):
-            for item in dl:
-                if isinstance(item, str) and item.startswith('http'):
-                    return item
-                if isinstance(item, dict):
-                    u = item.get('url', item.get('link', ''))
-                    if u and u.startswith('http'):
-                        return u
-    return None
+def parse_sng(sng_bytes):
+    """
+    Parse a .sng file and return dict {filename: bytes}.
+    SNG format: magic(8) + version(4) + xor_mask(8) + file_count(8) + entries...
+    Each entry: name_len(4LE) + name(utf8) + file_len(8LE) + data
+    """
+    files = {}
+    if not sng_bytes.startswith(b'SNGPKG'):
+        # Try as zip fallback
+        try:
+            import io
+            with zipfile.ZipFile(io.BytesIO(sng_bytes)) as zf:
+                for name in zf.namelist():
+                    files[name.lower()] = zf.read(name)
+            return files
+        except Exception:
+            return files
 
-def download_file(url, dest_path, session):
-    """Download url → dest_path. Returns True on success."""
+    offset = 6    # skip magic
+    # version (uint16)
+    offset += 2
+    # xor mask (8 bytes) — used to decode file data
+    xor_mask = sng_bytes[offset:offset+8]
+    offset += 8
+    # file count (uint64)
+    file_count = struct.unpack_from('<Q', sng_bytes, offset)[0]
+    offset += 8
+
+    for _ in range(file_count):
+        if offset + 4 > len(sng_bytes):
+            break
+        name_len = struct.unpack_from('<I', sng_bytes, offset)[0]
+        offset += 4
+        name = sng_bytes[offset:offset+name_len].decode('utf-8', errors='replace')
+        offset += name_len
+        file_len = struct.unpack_from('<Q', sng_bytes, offset)[0]
+        offset += 8
+        data = bytearray(sng_bytes[offset:offset+file_len])
+        # XOR decode
+        for i in range(len(data)):
+            data[i] ^= xor_mask[i % 8]
+        files[name.lower()] = bytes(data)
+        offset += file_len
+
+    return files
+
+# ── Download & extract ─────────────────────────────────────────────────────────
+
+def download_bytes(url, session):
     try:
         with session.get(url, stream=True, timeout=TIMEOUT) as r:
             r.raise_for_status()
-            with open(dest_path, 'wb') as f:
-                for chunk in r.iter_content(65536):
-                    f.write(chunk)
-        return True
+            return b''.join(r.iter_content(65536))
     except Exception as e:
         print(f'  [warn] download {url}: {e}')
-        return False
+        return None
 
-def extract_archive(archive_path, out_dir):
-    """Extract zip or rar archive. Returns list of extracted file paths."""
+def validate_chart(chart_bytes):
+    """Chart must have ExpertSingle with at least 50 notes."""
     try:
-        if zipfile.is_zipfile(archive_path):
-            with zipfile.ZipFile(archive_path, 'r') as zf:
-                zf.extractall(out_dir)
-                return [str(out_dir / n) for n in zf.namelist()]
-        # Try rar only if rarfile is installed
-        if HAS_RAR:
-            try:
-                with rarfile.RarFile(archive_path) as rf:
-                    rf.extractall(out_dir)
-                    return [str(out_dir / n) for n in rf.namelist()]
-            except Exception:
-                pass
-    except Exception as e:
-        print(f'  [warn] extract {archive_path.name}: {e}')
-    return []
-
-def find_chart_and_audio(extract_dir):
-    """Recursively find notes.chart and audio file under extract_dir."""
-    chart_path = audio_path = None
-    for root, dirs, files in os.walk(extract_dir):
-        for f in files:
-            fl = f.lower()
-            fp = Path(root) / f
-            if fl in CHART_NAMES and chart_path is None:
-                chart_path = fp
-            if Path(fl).suffix in AUDIO_EXTS and audio_path is None:
-                audio_path = fp
-    return chart_path, audio_path
-
-def validate_chart(chart_path):
-    """Quick sanity check: chart must have ExpertSingle with at least 50 notes."""
-    try:
-        text = chart_path.read_text(encoding='utf-8', errors='replace')
+        text = chart_bytes.decode('utf-8', errors='replace')
         if '[ExpertSingle]' not in text:
             return False
         expert = text.split('[ExpertSingle]')[1].split('}')[0]
-        note_count = expert.count(' = N ')
-        return note_count >= 50
+        return expert.count(' = N ') >= 50
     except Exception:
         return False
 
 def process_song(song, out_root, session):
-    """
-    Download + extract + validate one Chorus song.
-    Returns path to song folder on success, None on failure.
-    """
-    song_id   = str(song.get('id', song.get('link', 'unknown')))
-    title     = song.get('name', 'unknown')
-    artist    = song.get('artist', 'unknown')
-    folder    = out_root / safe_filename(f'{song_id}_{artist}_{title}')
+    """Download + parse SNG + validate + save one song. Returns folder or None."""
+    md5  = song.get('md5', '')
+    if not md5:
+        return None
 
+    folder = out_root / md5
     if folder.exists() and (folder / 'notes.chart').exists():
-        return str(folder)  # already downloaded
+        return str(folder)   # already done
 
     folder.mkdir(parents=True, exist_ok=True)
 
-    url = find_download_url(song)
-    if not url:
+    # Download SNG
+    url  = DL_URL.format(md5=md5)
+    data = download_bytes(url, session)
+    if not data:
         folder.rmdir()
         return None
 
-    # Determine archive extension from URL
-    ext = Path(url.split('?')[0]).suffix.lower() or '.zip'
-    archive = folder / f'archive{ext}'
-
-    if not download_file(url, archive, session):
+    # Parse SNG container
+    files = parse_sng(data)
+    if not files:
         return None
 
-    # Extract
-    extract_dir = folder / 'extracted'
-    extract_dir.mkdir(exist_ok=True)
-    extracted = extract_archive(archive, extract_dir)
-    if not extracted:
+    # Find chart file
+    chart_bytes = None
+    for name in ('notes.chart', 'notes.mid'):
+        if name in files:
+            chart_bytes = files[name]; break
+    if chart_bytes is None:
+        return None
+    if not validate_chart(chart_bytes):
         return None
 
-    chart_p, audio_p = find_chart_and_audio(extract_dir)
-    if chart_p is None or audio_p is None:
+    # Find audio file
+    audio_bytes = audio_ext = None
+    for ext in ('.opus', '.ogg', '.mp3', '.wav'):
+        for name, content in files.items():
+            if name.endswith(ext):
+                audio_bytes = content; audio_ext = ext; break
+        if audio_bytes:
+            break
+    if audio_bytes is None:
         return None
 
-    if not validate_chart(chart_p):
-        return None
+    # Save chart
+    (folder / 'notes.chart').write_bytes(chart_bytes)
 
-    # Copy chart + audio to clean location
-    import shutil
-    shutil.copy(chart_p, folder / 'notes.chart')
-
-    # Convert audio to opus if not already
-    target_audio = folder / 'song.opus'
-    if audio_p.suffix.lower() == '.opus':
-        shutil.copy(audio_p, target_audio)
+    # Save + convert audio to opus
+    raw_audio = folder / f'audio_raw{audio_ext}'
+    raw_audio.write_bytes(audio_bytes)
+    target = folder / 'song.opus'
+    if audio_ext == '.opus':
+        raw_audio.rename(target)
     else:
         import subprocess
         subprocess.run(
-            ['ffmpeg', '-y', '-i', str(audio_p), '-c:a', 'libopus',
-             '-b:a', '128k', str(target_audio)],
+            ['ffmpeg', '-y', '-i', str(raw_audio), '-c:a', 'libopus',
+             '-b:a', '128k', str(target)],
             capture_output=True)
+        try: raw_audio.unlink()
+        except Exception: pass
 
-    if not target_audio.exists():
+    if not target.exists():
         return None
+
+    # Save album art if present
+    for name, content in files.items():
+        if name.endswith('.jpg') or name.endswith('.png'):
+            (folder / 'album.jpg').write_bytes(content)
+            break
 
     # Save metadata
     meta = {
-        'id': song_id, 'title': title, 'artist': artist,
-        'genre':  song.get('genre', ''),
-        'album':  song.get('album', ''),
+        'md5':     md5,
+        'title':   song.get('name', ''),
+        'artist':  song.get('artist', ''),
+        'album':   song.get('album', ''),
+        'genre':   song.get('genre', ''),
+        'year':    song.get('year', ''),
         'charter': song.get('charter', ''),
-        'source': url,
+        'length_ms': song.get('song_length', 0),
     }
     (folder / 'meta.json').write_text(json.dumps(meta, indent=2))
-
-    # Cleanup archive + extracted folder to save space
-    try:
-        archive.unlink()
-        import shutil as sh
-        sh.rmtree(extract_dir, ignore_errors=True)
-    except Exception:
-        pass
-
     return str(folder)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--out',   default='./dataset', help='Output directory')
-    ap.add_argument('--limit', type=int, default=2000, help='Max songs to download')
+    ap.add_argument('--out',     default='./dataset', help='Output directory')
+    ap.add_argument('--limit',   type=int, default=2000)
     ap.add_argument('--workers', type=int, default=MAX_WORKERS)
     args = ap.parse_args()
 
@@ -244,10 +237,13 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     print(f'Scraping up to {args.limit} songs → {out}')
 
-    songs    = list(iter_all_songs(args.limit))
-    print(f'Found {len(songs)} songs from Chorus API')
+    songs = list(iter_all_songs(args.limit))
+    print(f'Found {len(songs)} songs from Enchor API')
+    if not songs:
+        print('No songs returned — check your internet connection')
+        return
 
-    ok = 0; fail = 0
+    ok = fail = 0
     session = requests.Session()
     session.headers['User-Agent'] = 'CloneHeroTrainer/1.0'
 
@@ -258,23 +254,22 @@ def main():
             if result:
                 ok += 1
                 if ok % 25 == 0:
-                    print(f'  Progress: {ok} ok / {fail} fail / {ok+fail} total')
+                    print(f'  {ok} ok / {fail} fail / {ok+fail} total')
             else:
                 fail += 1
 
-    print(f'\nDone: {ok} valid chart pairs saved to {out}')
-    print(f'      {fail} failed/invalid')
+    print(f'\nDone: {ok} saved, {fail} failed/invalid → {out}')
 
-    # Write index
     index = []
     for d in sorted(out.iterdir()):
-        if (d / 'notes.chart').exists() and (d / 'song.opus').exists():
+        if d.is_dir() and (d/'notes.chart').exists() and (d/'song.opus').exists():
             meta = {}
-            if (d / 'meta.json').exists():
-                meta = json.loads((d / 'meta.json').read_text())
+            mf = d / 'meta.json'
+            if mf.exists():
+                meta = json.loads(mf.read_text())
             index.append({'path': str(d), **meta})
     (out / 'index.json').write_text(json.dumps(index, indent=2))
-    print(f'Index written: {out}/index.json  ({len(index)} entries)')
+    print(f'Index: {out}/index.json  ({len(index)} entries)')
 
 
 if __name__ == '__main__':
