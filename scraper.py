@@ -72,8 +72,13 @@ SNG_MAGIC = b'SNGPKG\0\0'
 def parse_sng(sng_bytes):
     """
     Parse a .sng file and return dict {filename: bytes}.
-    SNG format: magic(8) + version(4) + xor_mask(8) + file_count(8) + entries...
-    Each entry: name_len(4LE) + name(utf8) + file_len(8LE) + data
+    Correct SNG format (from parse-sng npm package):
+      magic(6) + version_u32(4) + xorMask(16) + metadataLen_u64(8) + metadataCount_u64(8)
+      + metadata_entries([i32 keyLen][key][i32 valLen][val] × N)
+      + fileMetaLen_u64(8) + fileMetaCount_u64(8)
+      + fileMeta_entries([i8 nameLen][name][u64 dataLen][u64 dataOffset] × N)
+      + file_data_section
+    XOR per byte: cyclicIndex = i % 256; key = xorMask[cyclicIndex % 16] ^ cyclicIndex
     """
     files = {}
     if not sng_bytes.startswith(b'SNGPKG'):
@@ -87,31 +92,40 @@ def parse_sng(sng_bytes):
         except Exception:
             return files
 
-    offset = 6    # skip magic
-    # version (uint16)
-    offset += 2
-    # xor mask (8 bytes) — used to decode file data
-    xor_mask = sng_bytes[offset:offset+8]
-    offset += 8
-    # file count (uint64)
-    file_count = struct.unpack_from('<Q', sng_bytes, offset)[0]
-    offset += 8
+    # xorMask: 16 bytes at offset 10 (magic=6, version_u32=4)
+    xor_mask = sng_bytes[10:26]
 
+    # metadataCount at offset 34 (after metadataLen u64 at offset 26)
+    meta_count = struct.unpack_from('<Q', sng_bytes, 34)[0]
+
+    # skip metadata entries: each is [i32 keyLen][key][i32 valLen][val]
+    offset = 42
+    for _ in range(meta_count):
+        kl = struct.unpack_from('<i', sng_bytes, offset)[0]; offset += 4 + kl
+        vl = struct.unpack_from('<i', sng_bytes, offset)[0]; offset += 4 + vl
+
+    # fileMetaLen (skip, 8 bytes), then fileMetaCount (8 bytes)
+    offset += 8
+    file_count = struct.unpack_from('<Q', sng_bytes, offset)[0]; offset += 8
+
+    # fileMeta entries: [i8 nameLen][name][u64 dataLen][u64 dataOffset]
+    file_entries = []
     for _ in range(file_count):
-        if offset + 4 > len(sng_bytes):
-            break
-        name_len = struct.unpack_from('<I', sng_bytes, offset)[0]
-        offset += 4
-        name = sng_bytes[offset:offset+name_len].decode('utf-8', errors='replace')
-        offset += name_len
-        file_len = struct.unpack_from('<Q', sng_bytes, offset)[0]
-        offset += 8
-        data = bytearray(sng_bytes[offset:offset+file_len])
-        # XOR decode
-        for i in range(len(data)):
-            data[i] ^= xor_mask[i % 8]
-        files[name.lower()] = bytes(data)
-        offset += file_len
+        name_len = sng_bytes[offset]; offset += 1
+        name = sng_bytes[offset:offset+name_len].decode('utf-8', errors='replace'); offset += name_len
+        data_len = struct.unpack_from('<Q', sng_bytes, offset)[0]; offset += 8
+        data_offset = struct.unpack_from('<Q', sng_bytes, offset)[0]; offset += 8
+        file_entries.append((name, data_len, data_offset))
+
+    # contentsIndex is the absolute byte offset from the start of the SNG file
+    for name, data_len, data_offset in file_entries:
+        abs_offset = data_offset
+        raw = bytearray(sng_bytes[abs_offset:abs_offset + data_len])
+        # XOR decode: cyclicIndex wraps at 256, key = xorMask[cyclicIndex % 16] ^ cyclicIndex
+        for i in range(len(raw)):
+            cyclic = i % 256
+            raw[i] ^= xor_mask[cyclic % 16] ^ cyclic
+        files[name.lower()] = bytes(raw)
 
     return files
 
@@ -147,21 +161,19 @@ def process_song(song, out_root, session):
     if folder.exists() and (folder / 'notes.chart').exists():
         return str(folder)   # already done
 
-    folder.mkdir(parents=True, exist_ok=True)
+    # ── Download and validate entirely in memory first ──────────────────
+    # Folder is NOT created until everything checks out.
 
-    # Download SNG
     url  = DL_URL.format(md5=md5)
     data = download_bytes(url, session)
     if not data:
-        folder.rmdir()
         return None
 
-    # Parse SNG container
     files = parse_sng(data)
     if not files:
         return None
 
-    # Find chart file
+    # Find chart
     chart_bytes = None
     for name in ('notes.chart', 'notes.mid'):
         if name in files:
@@ -171,7 +183,7 @@ def process_song(song, out_root, session):
     if not validate_chart(chart_bytes):
         return None
 
-    # Find audio file
+    # Find audio
     audio_bytes = audio_ext = None
     for ext in ('.opus', '.ogg', '.mp3', '.wav'):
         for name, content in files.items():
@@ -181,6 +193,9 @@ def process_song(song, out_root, session):
             break
     if audio_bytes is None:
         return None
+
+    # ── Everything valid — now create folder and save ────────────────────
+    folder.mkdir(parents=True, exist_ok=True)
 
     # Save chart
     (folder / 'notes.chart').write_bytes(chart_bytes)
