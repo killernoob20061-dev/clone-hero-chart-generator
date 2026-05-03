@@ -1,6 +1,6 @@
 # Clone Hero Chart Generator
 
-Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo detection, genre-aware patterns, and an optional trainable neural model.
+Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo detection, genre-aware patterns, configurable fret palette, and an optional trainable neural model.
 
 ## Features
 
@@ -11,6 +11,7 @@ Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo
 - 🔁 **SSM phrase replication** — Self-Similarity Matrix finds structurally similar sections
 - 🎤 **Lyrics** — Whisper large-v3 transcription with word-level timestamps
 - 🎯 **4 difficulties** — Easy / Medium / Hard / Expert, all calibrated from real chart analysis
+- 🎛️ **Configurable fret palette** — choose any subset of the 5 frets via `--frets`
 - 🤖 **Optional neural model** — train ChartNet on real charts for human-level note placement
 
 ## Requirements
@@ -18,7 +19,6 @@ Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo
 ```
 pip install librosa numpy torch demucs openai-whisper mutagen Pillow scipy scikit-learn
 pip install madmom          # optional but recommended for beat tracking
-pip install rarfile         # optional, for .rar chart archives in scraper
 pip install requests        # for scraper
 ```
 
@@ -44,18 +44,47 @@ C:\Users\<you>\OneDrive\Tiedostot\Clone Hero\Songs\Artist - Title\
 
 Edit `OUT_DIR` in `chartgen.py` to change the output path.
 
+### Choosing which frets to use
+
+Use `--frets` to pick any combination of the 5 Clone Hero buttons:
+
+| Number | Color  |
+|--------|--------|
+| 0      | Green  |
+| 1      | Red    |
+| 2      | Yellow |
+| 3      | Blue   |
+| 4      | Orange |
+
+```bash
+# Default — Green / Red / Yellow
+python chartgen.py "MySong.mp3"
+
+# All 5 frets — Green / Red / Yellow / Blue / Orange
+python chartgen.py --frets 0,1,2,3,4 "MySong.mp3"
+
+# Top 3 only — Yellow / Blue / Orange
+python chartgen.py --frets 2,3,4 "MySong.mp3"
+
+# Just two frets — Green / Orange
+python chartgen.py --frets 0,4 "MySong.mp3"
+```
+
+The pitch contour is rescaled to fill whatever range you pick. Easy difficulty automatically restricts to the lower half of your chosen palette. Works with the neural model too.
+
 ### With trained neural model
 ```bash
 python chartgen.py --model ./checkpoints/best.pt "MySong.mp3"
+python chartgen.py --model ./checkpoints/best.pt --frets 0,1,2,3,4 "MySong.mp3"
 ```
 
 ## Training your own model
 
-### Step 1 — Scrape charts (1–3 days)
+### Step 1 — Scrape charts (1–3 hours)
 ```bash
 python scraper.py --out ./dataset --limit 2000
 ```
-Downloads chart+audio pairs from [Chorus](https://chorus.fightthe.pw).
+Downloads chart+audio pairs from [Enchor](https://enchor.us) (Chorus Encore). Each song is validated — must have an ExpertSingle track with 50+ notes and a valid audio file.
 
 ### Step 2 — Preprocess (~30 min)
 ```bash
@@ -80,13 +109,13 @@ python chartgen.py --model ./checkpoints/best.pt "MySong.mp3"
 |---|---|
 | `chartgen.py` | Main chart generator (v6) |
 | `chartmodel.py` | ChartNet model definition (~8M params) |
-| `scraper.py` | Downloads chart+audio pairs from Chorus API |
+| `scraper.py` | Downloads chart+audio pairs from Enchor API |
 | `preprocess_dataset.py` | Converts charts to beat-aligned mel tensors |
 | `train_chartnet.py` | Training loop with F1 tracking |
 
 ## Notes
 
-- Only uses frets **Green (0), Red (1), Yellow (2)** — never Blue or Orange
+- Default fret palette is **Green (0), Red (1), Yellow (2)** — use `--frets` to change
 - Audio output is always `song.opus` (192k)
 - Album art saved as `album.jpg`
 - Requires `ffmpeg` in PATH
