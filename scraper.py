@@ -1,52 +1,63 @@
 """
-Clone Hero chart scraper — downloads chart+audio pairs from Chorus API.
+Clone Hero chart scraper — downloads chart+audio pairs from Enchor API.
 Usage: python scraper.py --out ./dataset --limit 2000
 
-Targets: chorus.fightthe.pw  (largest public CH chart index with REST API)
+Targets: enchor.us  (the current main CH chart search engine, successor to Chorus)
 Saves each song as:  dataset/<id>/song.opus  +  dataset/<id>/notes.chart
-                     dataset/<id>/song.ini   +  dataset/<id>/meta.json
+                     dataset/<id>/meta.json
 """
 
-import os, sys, json, time, argparse, zipfile, rarfile, re
+import os, sys, json, time, argparse, zipfile, re
 import requests
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    import rarfile
+    HAS_RAR = True
+except ImportError:
+    HAS_RAR = False
+
 # ── Config ────────────────────────────────────────────────────────────────────
-CHORUS_API  = 'https://chorus.fightthe.pw/api/search'
-CHORUS_SONG = 'https://chorus.fightthe.pw/api/count'
-RATE_LIMIT  = 0.4     # seconds between API calls
-TIMEOUT     = 30      # seconds per HTTP request
-MAX_WORKERS = 4       # parallel downloads
+# Enchor API — successor to Chorus, currently active
+ENCHOR_API  = 'https://enchor.us/api/search'
+RATE_LIMIT  = 0.5     # seconds between API calls (be polite)
+TIMEOUT     = 40      # seconds per HTTP request
+MAX_WORKERS = 3       # parallel downloads
 AUDIO_EXTS  = {'.opus', '.ogg', '.mp3', '.wav'}
 CHART_NAMES = {'notes.chart', 'notes.mid'}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def safe_filename(s):
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', s)[:80]
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(s))[:80]
 
-def chorus_search(query='', page=0, per_page=50):
-    """Single page of Chorus search results."""
-    params = {'query': query, 'page': page, 'per_page': per_page,
-              'instrument': 'guitar'}
+def enchor_search(query='', page=1, per_page=20):
+    """Single page from the Enchor search API."""
+    params = {'query': query, 'page': page, 'per_page': per_page}
     try:
-        r = requests.get(CHORUS_API, params=params, timeout=TIMEOUT)
+        r = requests.get(ENCHOR_API, params=params, timeout=TIMEOUT,
+                         headers={'User-Agent': 'CloneHeroTrainer/1.0'})
         r.raise_for_status()
-        return r.json().get('songs', [])
+        data = r.json()
+        # Enchor returns {'songs': [...]} or a list directly
+        if isinstance(data, list):
+            return data
+        return data.get('songs', data.get('data', data.get('results', [])))
     except Exception as e:
-        print(f'  [warn] Chorus API page {page}: {e}')
+        print(f'  [warn] Enchor API page {page}: {e}')
         return []
 
 def iter_all_songs(limit=2000):
-    """Yield song dicts from Chorus until limit reached."""
-    seen, page = set(), 0
+    """Yield song dicts from Enchor until limit reached."""
+    seen, page = set(), 1
     while len(seen) < limit:
-        songs = chorus_search(page=page)
+        songs = enchor_search(page=page)
         if not songs:
+            print(f'  No more results at page {page}')
             break
         for s in songs:
-            sid = s.get('id') or s.get('link', '')
+            sid = str(s.get('id', s.get('md5', s.get('link', ''))))
             if sid and sid not in seen:
                 seen.add(sid)
                 yield s
@@ -56,21 +67,31 @@ def iter_all_songs(limit=2000):
         time.sleep(RATE_LIMIT)
 
 def find_download_url(song):
-    """Extract best direct download URL from a Chorus song dict."""
-    # Chorus returns 'directLinks' dict or 'link' string
-    dl = song.get('directLinks', {})
-    if isinstance(dl, dict):
-        # Prefer Archive.org or direct links
-        for key in ('archive', 'drive', 'dropbox', 'direct', 'mediafire'):
-            if key in dl:
-                return dl[key]
-        # Any value
-        for v in dl.values():
-            if v and v.startswith('http'):
-                return v
-    link = song.get('link', '')
-    if link and link.startswith('http'):
-        return link
+    """Extract best direct download URL from an Enchor song dict."""
+    # Enchor uses 'link' or nested 'links' / 'directLinks'
+    for key in ('link', 'download', 'download_url'):
+        v = song.get(key, '')
+        if v and str(v).startswith('http'):
+            return str(v)
+
+    # Nested dicts
+    for key in ('links', 'directLinks', 'sources'):
+        dl = song.get(key, {})
+        if isinstance(dl, dict):
+            for pref in ('archive', 'drive', 'dropbox', 'direct', 'mediafire'):
+                if pref in dl and dl[pref]:
+                    return dl[pref]
+            for v in dl.values():
+                if v and str(v).startswith('http'):
+                    return str(v)
+        elif isinstance(dl, list):
+            for item in dl:
+                if isinstance(item, str) and item.startswith('http'):
+                    return item
+                if isinstance(item, dict):
+                    u = item.get('url', item.get('link', ''))
+                    if u and u.startswith('http'):
+                        return u
     return None
 
 def download_file(url, dest_path, session):
@@ -93,13 +114,14 @@ def extract_archive(archive_path, out_dir):
             with zipfile.ZipFile(archive_path, 'r') as zf:
                 zf.extractall(out_dir)
                 return [str(out_dir / n) for n in zf.namelist()]
-        # Try rar (requires rarfile + unrar binary)
-        try:
-            with rarfile.RarFile(archive_path) as rf:
-                rf.extractall(out_dir)
-                return [str(out_dir / n) for n in rf.namelist()]
-        except Exception:
-            pass
+        # Try rar only if rarfile is installed
+        if HAS_RAR:
+            try:
+                with rarfile.RarFile(archive_path) as rf:
+                    rf.extractall(out_dir)
+                    return [str(out_dir / n) for n in rf.namelist()]
+            except Exception:
+                pass
     except Exception as e:
         print(f'  [warn] extract {archive_path.name}: {e}')
     return []
