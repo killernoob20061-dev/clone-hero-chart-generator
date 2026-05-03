@@ -1,6 +1,8 @@
 """
 Clone Hero chart generator v6 — human-quality, solo-aware charts.
 Usage: python chartgen.py <path_to_mp3> [<path_to_mp3> ...]
+       python chartgen.py --frets 0,1,2,3,4 <song.mp3>   # all 5 frets
+       python chartgen.py --frets 0,1,2     <song.mp3>   # GRY only (default)
 
 v6 highlights:
 - Note importance ranking: downbeats, chord roots, melody peaks scored first
@@ -11,7 +13,8 @@ v6 highlights:
 - Chromagram chord detection — chords only where music has actual chords
 - Sustain fill on solo notes — every note held to the next
 - Anti-HOPO violations, max 2-fret ergonomic jumps
-- Only frets 0/1/2 (Green/Red/Yellow) — never Blue or Orange
+- Configurable fret palette via --frets (e.g. 0,1,2 or 0,1,2,3,4)
+  Frets: 0=Green 1=Red 2=Yellow 3=Blue 4=Orange
 """
 
 import sys, os, re, subprocess, io, argparse
@@ -336,7 +339,7 @@ def detect_solo_regions(y_guit, y_full, sr, beat_times, tps, bpm):
 
 # ── Note-for-note solo charting ───────────────────────────────────────────────
 
-def chart_solo_region(y_guit, sr, tps, start_tick, end_tick, diff, bpm):
+def chart_solo_region(y_guit, sr, tps, start_tick, end_tick, diff, bpm, fret_pool=None):
     """
     Chart a solo region note-for-note using high-resolution pyin.
     Every voiced note in the solo becomes a chart note.
@@ -387,11 +390,18 @@ def chart_solo_region(y_guit, sr, tps, start_tick, end_tick, diff, bpm):
     if not note_frames:
         return []
 
+    if fret_pool is None:
+        fret_pool = [0, 1, 2]
+    # Easy uses only the lower half of the pool
+    if diff == 'easy':
+        fret_pool = fret_pool[:max(1, (len(fret_pool)+1)//2)]
+    max_idx = len(fret_pool) - 1
+
     # Pitch range for this solo section
     vm = midi_s[midi_s > 0]
-    p33, p66 = (float(np.percentile(vm,33)), float(np.percentile(vm,66))) if len(vm)>5 else (55.0,67.0)
+    # Build percentile thresholds for each fret index boundary
+    pcts = [float(np.percentile(vm, int(100*k/len(fret_pool)))) for k in range(1, len(fret_pool))] if len(vm) > 5 else []
 
-    max_fret = 2 if diff != 'easy' else 1
     min_gap  = {
         'expert': QTR,
         'hard':   HALF,
@@ -401,7 +411,7 @@ def chart_solo_region(y_guit, sr, tps, start_tick, end_tick, diff, bpm):
 
     raw_notes = []
     prev_tick = -99999
-    prev_fret = -1
+    prev_idx  = -1
 
     for frame in note_frames:
         t_abs = t_s + frame * hop / sr
@@ -413,20 +423,20 @@ def chart_solo_region(y_guit, sr, tps, start_tick, end_tick, diff, bpm):
             continue
 
         m = midi_s[min(frame, len(midi_s)-1)]
-        if m > 0:
-            fret = 0 if m < p33 else (1 if m < p66 else 2)
+        if m > 0 and pcts:
+            idx = sum(1 for p in pcts if m >= p)
         else:
             # Map by position in solo
-            fret = int((frame / max(len(midi_s),1)) * (max_fret+1)) % (max_fret+1)
-        fret = min(fret, max_fret)
+            idx = int((frame / max(len(midi_s),1)) * (max_idx+1)) % (max_idx+1)
+        idx = min(idx, max_idx)
 
         # Avoid same-fret HOPO repeats
-        if fret == prev_fret and tick - prev_tick <= HOPO:
-            fret = min(prev_fret+1, max_fret) if prev_fret < max_fret else max(prev_fret-1, 0)
+        if idx == prev_idx and tick - prev_tick <= HOPO:
+            idx = min(prev_idx+1, max_idx) if prev_idx < max_idx else max(prev_idx-1, 0)
 
-        raw_notes.append((tick, fret, 0))
+        raw_notes.append((tick, fret_pool[idx], 0))
         prev_tick = tick
-        prev_fret = fret
+        prev_idx  = idx
 
     if not raw_notes:
         return []
@@ -543,73 +553,90 @@ def build_chord_guide(y, y_guit, sr, tps, beat_ticks):
     return chord_ticks
 
 # ── Fret assignment helpers ───────────────────────────────────────────────────
+# All internal logic works with indices 0..N-1 into fret_pool.
+# The final remap translates index → actual Clone Hero fret number.
+# Default pool [0,1,2] = Green/Red/Yellow.  [0,1,2,3,4] = all five frets.
 
-def _ergonomic(frets, max_fret):
-    """Post-pass: cap jumps > 2, no same-fret HOPO repeats."""
+FRET_NAMES = {0:'Green', 1:'Red', 2:'Yellow', 3:'Blue', 4:'Orange'}
+
+def _pool_contour(contour, n_frets):
+    """Rescale a 0-based contour (originally 0..2) to 0..n_frets-1."""
+    return np.clip(contour * (n_frets - 1) / 2.0, 0, n_frets - 1)
+
+def _ergonomic(frets, max_idx):
+    """Post-pass: cap index jumps > 2, respect pool bounds."""
     r = list(frets)
     for i in range(1, len(r)):
-        # Cap jump
         if abs(r[i]-r[i-1]) > 2:
             r[i] = r[i-1] + (2 if r[i]>r[i-1] else -2)
-            r[i] = max(0, min(r[i], max_fret))
+            r[i] = max(0, min(r[i], max_idx))
     return r
 
-def _assign_metal(ticks, contour, max_fret, dbb, tps):
+def _assign_metal(ticks, contour, max_idx, dbb, tps):
     frets, base = [], contour[0] if len(contour) else 0
     for i, t in enumerate(ticks):
         if t % (BEAT*4) < QTR:
-            base = min(int(contour[i]), max_fret)
+            base = min(int(contour[i]), max_idx)
         if t % BEAT < QTR and i > 0:
             d = int(contour[i]) - base
             if d != 0 and abs(d) <= 1:
-                base = max(0, min(max_fret, base+int(np.sign(d))))
+                base = max(0, min(max_idx, base+int(np.sign(d))))
         frets.append(base)
     return frets
 
-def _assign_pop(ticks, contour, max_fret):
-    raw = [int(max(0, min(max_fret, v))) for v in contour]
+def _assign_pop(ticks, contour, max_idx):
+    raw = [int(max(0, min(max_idx, v))) for v in contour]
     sm  = list(sp_medfilt(np.array(raw, dtype=float), size=5))
-    r   = [int(max(0, min(max_fret, round(v)))) for v in sm]
+    r   = [int(max(0, min(max_idx, round(v)))) for v in sm]
     out = [r[0]]
     for i in range(1, len(r)):
         d = r[i]-out[-1]
         out.append(out[-1]+int(np.sign(d)) if abs(d)>1 else r[i])
     return out
 
-def _assign_electronic(ticks, contour, max_fret, bpm):
-    patterns = [[0,1,2,1],[2,1,0,1],[0,2,1,2],[1,0,1,2],[0,1,0,2],[2,0,1,0]]
+def _assign_electronic(ticks, contour, max_idx, bpm):
+    # Scale built-in patterns to available index range
+    base_patterns = [[0,1,2,1],[2,1,0,1],[0,2,1,2],[1,0,1,2],[0,1,0,2],[2,0,1,0]]
     dom = int(np.median(contour)) if len(contour) else 1
-    pat = [min(f, max_fret) for f in patterns[dom % len(patterns)]]
+    pat = [min(int(round(f * max_idx / 2)), max_idx) for f in base_patterns[dom % len(base_patterns)]]
     return [pat[((t//BEAT)%4*2+i) % len(pat)] for i, t in enumerate(ticks)]
 
-def _assign_rock(ticks, contour, max_fret, dbb, tps):
+def _assign_rock(ticks, contour, max_idx, dbb, tps):
     frets, prev, prev_dir = [], -1, 0
     for i, t in enumerate(ticks):
         dns = dbb.get(snap(t,BEAT), 1.0)
-        pf  = min(int(contour[i]), max_fret)
+        pf  = min(int(contour[i]), max_idx)
         gap = (ticks[i+1]-t) if i<len(ticks)-1 else BEAT
         if   gap <= EGTH and prev >= 0: f = prev
         elif dns >= 1.3:                f = pf
-        elif dns <= 0.75:               f = 0 if prev!=0 else min(1,max_fret)
+        elif dns <= 0.75:               f = 0 if prev!=0 else min(1,max_idx)
         else:
-            au = min(prev+1,max_fret) if prev>=0 else pf
-            ad = max(prev-1,0)        if prev>=0 else pf
+            au = min(prev+1,max_idx) if prev>=0 else pf
+            ad = max(prev-1,0)       if prev>=0 else pf
             f  = (au if pf>prev else ad) if pf!=prev else (au if prev_dir<=0 else ad)
-        if prev>=0 and abs(f-prev)>2: f=prev+(2 if f>prev else -2); f=max(0,min(f,max_fret))
+        if prev>=0 and abs(f-prev)>2: f=prev+(2 if f>prev else -2); f=max(0,min(f,max_idx))
         if f==prev and gap<=HOPO and prev>=0:
-            f = min(prev+1,max_fret) if prev<max_fret else max(prev-1,0)
+            f = min(prev+1,max_idx) if prev<max_idx else max(prev-1,0)
         prev_dir=f-prev if prev>=0 else 0; prev=f; frets.append(f)
     return frets
 
-def assign_frets_genre(ticks, fret_at, genre, dbb, tps, bpm=120, max_fret=2):
-    if not ticks: return []
-    contour = np.array([fret_at(t) for t in ticks], dtype=float)
-    if   genre == 'metal':      frets = _assign_metal(ticks, contour, max_fret, dbb, tps)
-    elif genre == 'electronic': frets = _assign_electronic(ticks, contour, max_fret, bpm)
-    elif genre == 'pop':        frets = _assign_pop(ticks, contour, max_fret)
-    else:                       frets = _assign_rock(ticks, contour, max_fret, dbb, tps)
-    frets = _ergonomic(frets, max_fret)
-    return [(ticks[i], frets[i], 0) for i in range(len(ticks))]
+def assign_frets_genre(ticks, fret_at, genre, dbb, tps, bpm=120, fret_pool=None):
+    """Assign frets using genre patterns, then remap through fret_pool."""
+    if fret_pool is None:
+        fret_pool = [0, 1, 2]
+    if not ticks:
+        return []
+    max_idx = len(fret_pool) - 1
+    raw_contour = np.array([fret_at(t) for t in ticks], dtype=float)
+    contour = _pool_contour(raw_contour, len(fret_pool))
+
+    if   genre == 'metal':      indices = _assign_metal(ticks, contour, max_idx, dbb, tps)
+    elif genre == 'electronic': indices = _assign_electronic(ticks, contour, max_idx, bpm)
+    elif genre == 'pop':        indices = _assign_pop(ticks, contour, max_idx)
+    else:                       indices = _assign_rock(ticks, contour, max_idx, dbb, tps)
+    indices = _ergonomic(indices, max_idx)
+    # Remap index → actual fret number
+    return [(ticks[i], fret_pool[indices[i]], 0) for i in range(len(ticks))]
 
 # ── SSM phrase replication ────────────────────────────────────────────────────
 
@@ -677,20 +704,25 @@ def add_sustains(notes, target_pct):
 
 # ── Chords ────────────────────────────────────────────────────────────────────
 
-def add_chords(notes, beat_ticks, dbb, diff, chord_guide=None):
+def add_chords(notes, beat_ticks, dbb, diff, chord_guide=None, fret_pool=None):
+    if fret_pool is None:
+        fret_pool = [0, 1, 2]
     targets = {'expert':0.38,'hard':0.22,'medium':0.12,'easy':0.05}
     target  = targets.get(diff, 0.15)
     bset    = set(beat_ticks)
     tset    = {(t,f,s) for t,f,s in notes}
     extra   = []
 
+    n = len(fret_pool)
     for t,f,s in notes:
         if t not in bset: continue
         if dbb.get(t,1.0) < 0.9: continue
         if s == 0: continue
         # Prefer chord guide: only add chord if chromagram supports it
         if chord_guide is not None and t not in chord_guide: continue
-        cf = (f+2)%3
+        # Pick a chord fret 2 steps away in the pool (wraps within pool)
+        idx = fret_pool.index(f) if f in fret_pool else 0
+        cf = fret_pool[(idx + 2) % n]
         if (t,cf,s) not in tset:
             extra.append((t,cf,s))
 
@@ -899,14 +931,20 @@ def build_diff(diff, beats, eighths, sixteenths, onset_ticks,
                fret_at, duration, dbb, genre, bpm, tps,
                solo_regions, y_guit, y, sr,
                tmap=None, sticks=None, chord_guide=None,
-               importance_scores=None, phrases=None, phrase_groups=None):
+               importance_scores=None, phrases=None, phrase_groups=None,
+               fret_pool=None):
+
+    if fret_pool is None:
+        fret_pool = [0, 1, 2]
+    # Easy difficulty restricts to lower half of the fret pool
+    easy_pool = fret_pool[:max(1, (len(fret_pool)+1)//2)]
+    active_pool = easy_pool if diff == 'easy' else fret_pool
 
     scale    = duration / 180.0
     note_tgt = {'expert':int(1200*scale),'hard':int(850*scale),
                 'medium':int(650*scale), 'easy':int(380*scale)}[diff]
     sus_tgt  = {'expert':0.10,'hard':0.15,'medium':0.22,'easy':0.35}[diff]
     min_gaps = {'expert':QTR, 'hard':HALF, 'medium':BEAT, 'easy':BEAT*2}
-    max_f    = 2 if diff != 'easy' else 1
     min_gap  = min_gaps[diff]
 
     # Tick ranges occupied by solos
@@ -951,7 +989,7 @@ def build_diff(diff, beats, eighths, sixteenths, onset_ticks,
         pool = [pool[int(i*step)] for i in range(note_tgt)]
 
     # ── Genre fret assignment ─────────────────────────────────────────────
-    notes = assign_frets_genre(pool, fret_at, genre, dbb, tps, bpm, max_f)
+    notes = assign_frets_genre(pool, fret_at, genre, dbb, tps, bpm, active_pool)
 
     # ── Phrase motif repetition (identical phrases → identical patterns) ──
     if phrases and phrase_groups:
@@ -969,7 +1007,7 @@ def build_diff(diff, beats, eighths, sixteenths, onset_ticks,
     # ── Solo regions: note-for-note chart, merged in ───────────────────────
     solo_notes = []
     for ts, te in (solo_regions or []):
-        solo_notes.extend(chart_solo_region(y_guit, sr, tps, ts, te, diff, bpm))
+        solo_notes.extend(chart_solo_region(y_guit, sr, tps, ts, te, diff, bpm, active_pool))
 
     if solo_notes:
         notes = [(t,f,s) for t,f,s in notes if t not in solo_tick_set]
@@ -1010,7 +1048,7 @@ def get_lyrics(mp3, tps, section_events):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def generate(mp3_path):
+def generate(mp3_path, fret_pool=None):
     print(f'\n{"="*60}\n  {os.path.basename(mp3_path)}\n{"="*60}')
     mp3_path = os.path.abspath(mp3_path)
 
@@ -1041,7 +1079,10 @@ def generate(mp3_path):
     genre                            = detect_genre(y, sr)
     bpm, beat_times, bpm_events, _  = analyze_tempo(y_perc, sr, mp3_path)
     tps                              = (bpm/60.0)*RES
-    print(f'  BPM={bpm:.1f}  Duration={duration:.1f}s  Genre={genre}')
+    if fret_pool is None:
+        fret_pool = [0, 1, 2]
+    fret_names = '/'.join(FRET_NAMES.get(f, str(f)) for f in fret_pool)
+    print(f'  BPM={bpm:.1f}  Duration={duration:.1f}s  Genre={genre}  Frets={fret_names}')
 
     beats, eighths, sixteenths = build_grids(beat_times, tps)
     onset_ticks                = get_onsets(y, y_perc, sr, tps, mp3_path)
@@ -1074,8 +1115,9 @@ def generate(mp3_path):
             solo_regions, y_guit, y, sr,
             tmap=tmap, sticks=sticks, chord_guide=chord_guide,
             importance_scores=importance_scores,
-            phrases=phrases, phrase_groups=phrase_groups)
-        notes = add_chords(notes, beats, dbb, diff, chord_guide)
+            phrases=phrases, phrase_groups=phrase_groups,
+            fret_pool=fret_pool)
+        notes = add_chords(notes, beats, dbb, diff, chord_guide, fret_pool=fret_pool)
         diffs[diff] = notes
         ps = round(100*sum(1 for _,_,s in notes if s>0)/max(len(notes),1))
         solo_n = sum(1 for t,_,_ in notes
@@ -1149,25 +1191,31 @@ def _mel_for_chartnet(y, sr, beat_times, n_mels=128, hop_length=512):
     return torch.tensor(mel, dtype=torch.float32), grid_times
 
 
-def chartnet_notes(y, sr, beat_times, tps, diff, solo_tick_set):
+def chartnet_notes(y, sr, beat_times, tps, diff, solo_tick_set, fret_pool=None):
     """
     Use trained ChartNet to predict note positions + frets.
+    ChartNet outputs fret indices 0..N; we remap through fret_pool.
     Falls back gracefully if model not loaded.
     Returns list of (tick, fret, 0) or None.
     """
+    if fret_pool is None:
+        fret_pool = [0, 1, 2]
     if _chartnet_model is None:
         return None
     try:
         mel, grid_times = _mel_for_chartnet(y, sr, beat_times)
         raw = predict_chart(_chartnet_model, mel, diff, device=_chartnet_device)
         notes = []
-        for grid_pos, fret in raw:
+        max_idx = len(fret_pool) - 1
+        for grid_pos, fret_idx in raw:
             if grid_pos >= len(grid_times):
                 continue
             tick = snap(t2tick(grid_times[grid_pos], tps), QTR)
             if tick in solo_tick_set:
                 continue
-            notes.append((tick, min(fret, 2), 0))
+            # Remap model's fret index (trained on 0-2) → active fret pool
+            mapped = fret_pool[min(fret_idx, max_idx)]
+            notes.append((tick, mapped, 0))
         return sorted(notes, key=lambda x: x[0]) if notes else None
     except Exception as e:
         print(f'  [warn] ChartNet inference failed ({e}), using algorithmic fallback')
@@ -1175,11 +1223,38 @@ def chartnet_notes(y, sr, beat_times, tps, diff, solo_tick_set):
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(add_help=False)
+    ap = argparse.ArgumentParser(
+        description='Clone Hero chart generator v6',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Fret numbers:  0=Green  1=Red  2=Yellow  3=Blue  4=Orange
+
+Examples:
+  python chartgen.py song.mp3
+  python chartgen.py --frets 0,1,2,3,4 song.mp3        # all 5 frets
+  python chartgen.py --frets 0,1,2     song.mp3        # GRY only (default)
+  python chartgen.py --frets 2,3,4     song.mp3        # YBO only
+  python chartgen.py --model best.pt --frets 0,1,2,3,4 song.mp3
+""")
     ap.add_argument('--model', default=None,
                     help='Path to trained ChartNet checkpoint (optional)')
+    ap.add_argument('--frets', default='0,1,2',
+                    help='Comma-separated fret numbers to use, e.g. 0,1,2 or 0,1,2,3,4 '
+                         '(0=Green 1=Red 2=Yellow 3=Blue 4=Orange, default: 0,1,2)')
     ap.add_argument('songs', nargs='*')
     known, _ = ap.parse_known_args()
+
+    # Parse fret pool
+    try:
+        fret_pool = [int(f.strip()) for f in known.frets.split(',')]
+        fret_pool = sorted(set(max(0, min(4, f)) for f in fret_pool))
+        if not fret_pool:
+            raise ValueError
+    except Exception:
+        print('ERROR: --frets must be comma-separated numbers 0-4, e.g. --frets 0,1,2')
+        sys.exit(1)
+    print(f'Fret palette: {", ".join(FRET_NAMES[f] for f in fret_pool)} '
+          f'({",".join(str(f) for f in fret_pool)})')
 
     # Also check environment variable
     model_path = known.model or os.environ.get('CHARTNET_MODEL')
@@ -1188,9 +1263,8 @@ if __name__ == '__main__':
 
     songs = known.songs or [a for a in sys.argv[1:] if not a.startswith('--')]
     if not songs:
-        print('Usage: python chartgen.py [--model checkpoint.pt] <song.mp3> ...')
+        print('Usage: python chartgen.py [--model checkpoint.pt] [--frets 0,1,2] <song.mp3> ...')
         sys.exit(1)
 
-    import argparse   # ensure imported for any re-use
     for mp3 in songs:
-        generate(mp3)
+        generate(mp3, fret_pool=fret_pool)
