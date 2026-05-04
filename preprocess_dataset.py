@@ -391,8 +391,12 @@ def main():
     out_dir  = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    song_dirs = [d for d in sorted(data_dir.iterdir()) if d.is_dir()
-                 and (d/'notes.chart').exists() and (d/'song.opus').exists()]
+    all_dirs = [d for d in sorted(data_dir.iterdir()) if d.is_dir()
+                and (d/'notes.chart').exists() and (d/'song.opus').exists()]
+    song_dirs = [d for d in all_dirs if not (out_dir / f'{d.name}.pt').exists()]
+    skip_count = len(all_dirs) - len(song_dirs)
+    if skip_count:
+        print(f'Skipping {skip_count} already-processed songs')
     print(f'Processing {len(song_dirs)} songs → {out_dir}')
     print('Targets: note, fret (0-4), sustain (4 buckets), chord fret, note type (4 types)')
 

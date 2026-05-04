@@ -17,7 +17,7 @@ v6 highlights:
   Frets: 0=Green 1=Red 2=Yellow 3=Blue 4=Orange
 """
 
-import sys, os, re, subprocess, io, argparse
+import sys, os, re, subprocess, io, argparse, shutil
 import librosa
 import numpy as np
 import whisper
@@ -1459,6 +1459,10 @@ Examples:
 """)
     ap.add_argument('--model', default=None,
                     help='Path to trained ChartNet checkpoint (optional)')
+    ap.add_argument('--out', default='.',
+                    help='Output directory for generated chart folders (default: current directory)')
+    ap.add_argument('--no-lyrics', action='store_true',
+                    help='Skip Whisper transcription (faster, no lyrics in chart)')
     ap.add_argument('--frets', default='0,1,2',
                     help='Comma-separated fret numbers to use, e.g. 0,1,2 or 0,1,2,3,4 '
                          '(0=Green 1=Red 2=Yellow 3=Blue 4=Orange, default: 0,1,2)')
@@ -1482,10 +1486,25 @@ Examples:
     if model_path and os.path.exists(model_path):
         load_chartnet(model_path)
 
+    if not shutil.which('ffmpeg'):
+        print('ERROR: ffmpeg not found in PATH. Install ffmpeg and ensure it is on PATH.')
+        print('  Linux:   sudo apt install ffmpeg')
+        print('  macOS:   brew install ffmpeg')
+        print('  Windows: https://ffmpeg.org/download.html')
+        sys.exit(1)
+
     songs = known.songs or [a for a in sys.argv[1:] if not a.startswith('--')]
     if not songs:
         print('Usage: python chartgen.py [--model checkpoint.pt] [--frets 0,1,2] <song.mp3> ...')
         sys.exit(1)
 
-    for mp3 in songs:
-        generate(mp3, fret_pool=fret_pool)
+    out_dir   = os.path.abspath(known.out)
+    no_lyrics = known.no_lyrics
+    os.makedirs(out_dir, exist_ok=True)
+
+    from tqdm import tqdm
+    song_bar = tqdm(songs, desc='Songs', unit='song', colour='magenta',
+                    dynamic_ncols=True, disable=len(songs) == 1)
+    for mp3 in song_bar:
+        song_bar.set_postfix(file=os.path.basename(mp3)[:30])
+        generate(mp3, fret_pool=fret_pool, out_dir=out_dir, no_lyrics=no_lyrics)

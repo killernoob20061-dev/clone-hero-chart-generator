@@ -21,6 +21,28 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import f1_score, precision_score, recall_score
 
+# ── Data augmentation ─────────────────────────────────────────────────────────
+
+def augment_mel(mel):
+    """SpecAugment-style augmentation: freq mask, time mask, pitch shift, noise."""
+    mel = mel.clone()
+    T, F = mel.shape
+    # frequency masking
+    f_w = torch.randint(1, 11, (1,)).item()
+    f_s = torch.randint(0, max(1, F - f_w), (1,)).item()
+    mel[:, f_s:f_s + f_w] = 0.0
+    # time masking
+    t_w = torch.randint(1, 9, (1,)).item()
+    t_s = torch.randint(0, max(1, T - t_w), (1,)).item()
+    mel[t_s:t_s + t_w, :] = 0.0
+    # pitch shift simulation (roll mel bins)
+    shift = torch.randint(-2, 3, (1,)).item()
+    if shift != 0:
+        mel = torch.roll(mel, shift, dims=1)
+    # Gaussian noise
+    mel = mel + torch.randn_like(mel) * 0.05
+    return mel
+
 from chartmodel  import ChartNet, ChartLoss, DIFF_MAP, N_FRETS, N_SUSTAIN, N_CHORD, N_TYPE
 from preprocess_dataset import ChartDataset
 
@@ -65,7 +87,7 @@ def compute_metrics(logits, note_targets, fret_targets,
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0,
-                scaler=None):
+                scaler=None, augment=True):
     model.train()
     use_amp = scaler is not None
     totals = {'loss': 0.0, 'note': 0.0, 'fret': 0.0,
@@ -76,6 +98,9 @@ def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0,
             mel.to(device), note_t.to(device), fret_t.to(device),
             sustain_t.to(device), chord_t.to(device),
             type_t.to(device), diff_t.to(device))
+
+        if augment:
+            mel = augment_mel(mel)
 
         optimizer.zero_grad()
         with torch.autocast(device_type=device.type, enabled=use_amp):
@@ -257,6 +282,11 @@ def main():
             if use_amp:
                 ckpt_periodic['scaler_state'] = scaler.state_dict()
             torch.save(ckpt_periodic, out_dir / f'epoch_{epoch+1:03d}.pt')
+
+        # Keep only the 3 most recent periodic checkpoints
+        old_ckpts = sorted(out_dir.glob('epoch_*.pt'))
+        for old in old_ckpts[:-3]:
+            old.unlink(missing_ok=True)
 
     (out_dir / 'history.json').write_text(json.dumps(history, indent=2))
     print(f'\nTraining complete. Best note F1: {best_f1:.3f}')
