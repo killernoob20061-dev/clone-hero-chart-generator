@@ -2,8 +2,9 @@
 Train ChartNet v2 on preprocessed Clone Hero chart pairs.
 Usage: python train_chartnet.py --data ./processed --out ./checkpoints
 
-Trains for ~60 epochs, saves best checkpoint by validation note F1.
-Estimated time: 6-12h on RTX 3090, 18-30h on RTX 3060.
+Trains for ~40 epochs, saves best checkpoint by validation note F1.
+Mixed precision (AMP) is enabled automatically on CUDA.
+Estimated time: 4-7h on RTX 3090, 12-18h on RTX 3060 (with AMP).
 
 After training:
     chartgen.py --model ./checkpoints/best.pt <song.mp3>
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import f1_score, precision_score, recall_score
 
@@ -62,8 +64,10 @@ def compute_metrics(logits, note_targets, fret_targets,
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0):
+def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0,
+                scaler=None):
     model.train()
+    use_amp = scaler is not None
     totals = {'loss': 0.0, 'note': 0.0, 'fret': 0.0,
               'sustain': 0.0, 'chord': 0.0, 'type': 0.0}
 
@@ -74,11 +78,20 @@ def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0):
             type_t.to(device), diff_t.to(device))
 
         optimizer.zero_grad()
-        logits = model(mel, diff_t)
-        loss, sub = criterion(logits, note_t, fret_t, sustain_t, chord_t, type_t)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(mel, diff_t)
+            loss, sub = criterion(logits, note_t, fret_t, sustain_t, chord_t, type_t)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
 
         totals['loss']    += loss.item()
         totals['note']    += sub['note'].item()
@@ -92,7 +105,7 @@ def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0):
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, criterion, device, threshold=0.35):
+def eval_epoch(model, loader, criterion, device, threshold=0.35, use_amp=False):
     model.eval()
     total_loss = 0.0
     all_metrics = []
@@ -103,8 +116,9 @@ def eval_epoch(model, loader, criterion, device, threshold=0.35):
             sustain_t.to(device), chord_t.to(device),
             type_t.to(device), diff_t.to(device))
 
-        logits = model(mel, diff_t)
-        loss, _ = criterion(logits, note_t, fret_t, sustain_t, chord_t, type_t)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(mel, diff_t)
+            loss, _ = criterion(logits, note_t, fret_t, sustain_t, chord_t, type_t)
         total_loss += loss.item()
 
         m = compute_metrics(logits, note_t, fret_t, sustain_t,
@@ -122,9 +136,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data',      default='./processed',   help='Preprocessed .pt dir')
     ap.add_argument('--out',       default='./checkpoints', help='Checkpoint output dir')
-    ap.add_argument('--epochs',    type=int,   default=60)
-    ap.add_argument('--batch',     type=int,   default=24,
-                    help='Batch size (reduce to 16 if OOM — model is ~35M params)')
+    ap.add_argument('--epochs',    type=int,   default=40)
+    ap.add_argument('--batch',     type=int,   default=48,
+                    help='Batch size (reduce to 24 if OOM; AMP halves activation memory)')
     ap.add_argument('--lr',        type=float, default=2e-4)
     ap.add_argument('--val_split', type=float, default=0.1)
     ap.add_argument('--workers',   type=int,   default=4)
@@ -173,8 +187,11 @@ def main():
                     optimizer, T_max=args.epochs, eta_min=1e-6)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    use_amp  = device.type == 'cuda'
+    scaler   = GradScaler() if use_amp else None
     print(f'  Model: {n_params/1e6:.1f}M parameters')
     print(f'  Heads: note | fret(5) | sustain(4) | chord(6) | type(4)')
+    print(f'  AMP: {"enabled (fp16)" if use_amp else "disabled (cpu)"}')
 
     start_epoch = 0
     best_f1     = 0.0
@@ -183,6 +200,8 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt['model_state'])
         optimizer.load_state_dict(ckpt['optim_state'])
+        if use_amp and 'scaler_state' in ckpt:
+            scaler.load_state_dict(ckpt['scaler_state'])
         start_epoch = ckpt.get('epoch', 0) + 1
         best_f1     = ckpt.get('best_f1', 0.0)
         print(f'  Resumed from epoch {start_epoch}  best_f1={best_f1:.3f}')
@@ -192,8 +211,9 @@ def main():
     print(f'\nTraining for {args.epochs} epochs...')
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
-        tr = train_epoch(model, train_loader, optimizer, criterion, device)
-        va = eval_epoch(model, val_loader, criterion, device)
+        tr = train_epoch(model, train_loader, optimizer, criterion, device,
+                         scaler=scaler)
+        va = eval_epoch(model, val_loader, criterion, device, use_amp=use_amp)
         scheduler.step()
         elapsed = time.time() - t0
         lr_now  = scheduler.get_last_lr()[0]
@@ -213,24 +233,30 @@ def main():
 
         if va['note_f1'] > best_f1:
             best_f1 = va['note_f1']
-            torch.save({
+            ckpt_best = {
                 'epoch':        epoch,
                 'model_state':  model.state_dict(),
                 'optim_state':  optimizer.state_dict(),
                 'model_kwargs': model_kwargs,
                 'best_f1':      best_f1,
                 'val_metrics':  va,
-            }, out_dir / 'best.pt')
+            }
+            if use_amp:
+                ckpt_best['scaler_state'] = scaler.state_dict()
+            torch.save(ckpt_best, out_dir / 'best.pt')
             print(f'  ✓ New best F1={best_f1:.3f} → saved best.pt')
 
         if (epoch+1) % 5 == 0:
-            torch.save({
+            ckpt_periodic = {
                 'epoch':        epoch,
                 'model_state':  model.state_dict(),
                 'optim_state':  optimizer.state_dict(),
                 'model_kwargs': model_kwargs,
                 'best_f1':      best_f1,
-            }, out_dir / f'epoch_{epoch+1:03d}.pt')
+            }
+            if use_amp:
+                ckpt_periodic['scaler_state'] = scaler.state_dict()
+            torch.save(ckpt_periodic, out_dir / f'epoch_{epoch+1:03d}.pt')
 
     (out_dir / 'history.json').write_text(json.dumps(history, indent=2))
     print(f'\nTraining complete. Best note F1: {best_f1:.3f}')
