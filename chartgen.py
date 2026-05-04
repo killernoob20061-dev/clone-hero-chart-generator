@@ -67,8 +67,6 @@ QTR  = RES // 4   # 16th
 EGTH = RES // 8   # 32nd
 HOPO = HALF       # auto-HOPO threshold in CH
 
-OUT_DIR = r'C:\Users\MrSchneider\OneDrive\Tiedostot\Clone Hero\Songs'
-
 # ── Tick helpers ─────────────────────────────────────────────────────────────
 
 def t2tick(t, tps):  return int(round(t * tps))

@@ -99,7 +99,7 @@ def train_epoch(model, loader, optimizer, criterion, device, grad_clip=1.0,
             sustain_t.to(device), chord_t.to(device),
             type_t.to(device), diff_t.to(device))
 
-        if augment:
+        if augment and torch.rand(1).item() < 0.5:
             mel = augment_mel(mel)
 
         optimizer.zero_grad()
@@ -222,7 +222,7 @@ def main():
     best_f1     = 0.0
 
     if args.resume and Path(args.resume).exists():
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt['model_state'])
         optimizer.load_state_dict(ckpt['optim_state'])
         if use_amp and 'scaler_state' in ckpt:

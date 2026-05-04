@@ -266,7 +266,7 @@ def predict_chart(model, mel_tensor, difficulty_str,
 
 
 def load_model(checkpoint_path, device='cpu'):
-    ckpt  = torch.load(checkpoint_path, map_location=device)
+    ckpt  = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model = ChartNet(**ckpt.get('model_kwargs', {}))
     model.load_state_dict(ckpt['model_state'])
     model.eval()
