@@ -246,7 +246,7 @@ def main():
             torch.save(ckpt_best, out_dir / 'best.pt')
             print(f'  ✓ New best F1={best_f1:.3f} → saved best.pt')
 
-        if (epoch+1) % 5 == 0:
+        if (epoch+1) % 1 == 0:
             ckpt_periodic = {
                 'epoch':        epoch,
                 'model_state':  model.state_dict(),
