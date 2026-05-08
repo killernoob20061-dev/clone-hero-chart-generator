@@ -13,43 +13,60 @@ from PIL import Image, ImageTk, ImageFilter
 
 # ── Find Python executable (robust — works even when PATH is stripped) ─────────
 def _find_python():
-    # 1. Already known (running as .py)
+    # Running as plain .py — use current interpreter
     if not getattr(sys, 'frozen', False):
         return sys.executable
-    # 2. py launcher — always at C:\Windows\py.exe, works even with stripped PATH
-    py = shutil.which('py') or r'C:\Windows\py.exe'
-    if Path(py).exists():
-        return py
-    # 3. PATH lookup
-    found = shutil.which('python') or shutil.which('python3')
-    if found:
-        return found
-    # 3. Windows registry — HKCU and HKLM Python installs
+
+    app_dir = Path(sys.executable).parent
+
+    def _ok(p):
+        """Valid only if the file exists AND is NOT inside our own app folder."""
+        p = Path(str(p))
+        try:
+            p.relative_to(app_dir)
+            return False  # inside app folder — this is Nuitka's own python, skip it
+        except ValueError:
+            return p.exists()
+
+    # 1. Windows py launcher — lives in System32, never in app folder
+    if _ok(r'C:\Windows\py.exe'):
+        return r'C:\Windows\py.exe'
+
+    # 2. Windows registry (newest version first)
     for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
         for base in (r'SOFTWARE\Python\PythonCore', r'SOFTWARE\WOW6432Node\Python\PythonCore'):
             try:
                 with winreg.OpenKey(hive, base) as core:
-                    for i in range(winreg.QueryInfoKey(core)[0]):
-                        ver = winreg.EnumKey(core, i)
+                    versions = [winreg.EnumKey(core, i)
+                                for i in range(winreg.QueryInfoKey(core)[0])]
+                    for ver in sorted(versions, reverse=True):
                         try:
                             with winreg.OpenKey(core, rf'{ver}\InstallPath') as ip:
                                 path = winreg.QueryValueEx(ip, 'ExecutablePath')[0]
-                                if path and Path(path).exists():
-                                    return path
+                                if _ok(path):
+                                    return str(path)
                         except OSError:
                             pass
             except OSError:
                 pass
-    # 4. Common install locations
+
+    # 3. Common install locations (newest first)
     for candidate in [
-        r'C:\Python310\python.exe', r'C:\Python311\python.exe', r'C:\Python312\python.exe',
-        Path.home() / 'AppData/Local/Programs/Python/Python310/python.exe',
-        Path.home() / 'AppData/Local/Programs/Python/Python311/python.exe',
         Path.home() / 'AppData/Local/Programs/Python/Python312/python.exe',
+        Path.home() / 'AppData/Local/Programs/Python/Python311/python.exe',
+        Path.home() / 'AppData/Local/Programs/Python/Python310/python.exe',
+        r'C:\Python312\python.exe', r'C:\Python311\python.exe', r'C:\Python310\python.exe',
     ]:
-        if Path(candidate).exists():
+        if _ok(candidate):
             return str(candidate)
-    return 'python'  # last resort
+
+    # 4. PATH lookup last — filter out anything inside our folder
+    for name in ('python', 'python3'):
+        found = shutil.which(name)
+        if found and _ok(found):
+            return found
+
+    return 'python'
 
 # ── Path resolution (works as .py, PyInstaller .exe, and Nuitka .exe) ─────────
 if getattr(sys, 'frozen', False):
