@@ -255,33 +255,73 @@ def predict_chart(model, mel_tensor, difficulty_str,
     """
     Run inference on a full-song mel tensor.
     mel_tensor: (seq_len, n_mels)
+
+    Handles songs longer than 2048 frames by running overlapping chunks
+    of 2048 and stitching predictions from the non-boundary region of each.
     """
+    MAX_LEN    = 2048
+    CHUNK      = MAX_LEN          # chunk size = max positional encoding
+    STRIDE     = 1536             # advance 1536 frames per chunk (512 overlap)
+    GUARD      = 256              # ignore predictions within GUARD frames of each edge
+
     model.eval()
-    mel      = mel_tensor.unsqueeze(0).to(device)
     diff_idx = torch.tensor([DIFF_MAP.get(difficulty_str, 3)], device=device)
+    seq_len  = mel_tensor.shape[0]
 
-    out = model(mel, diff_idx)
+    def _decode_chunk(chunk_mel, offset):
+        """Run model on a (<=2048, n_mels) slice, return notes with global grid_pos."""
+        mel = chunk_mel.unsqueeze(0).to(device)
+        out = model(mel, diff_idx)
+        note_probs    = torch.sigmoid(out['note'].squeeze(0).squeeze(-1))
+        fret_preds    = out['fret'].squeeze(0).argmax(dim=-1)
+        sustain_preds = out['sustain'].squeeze(0).argmax(dim=-1)
+        chord_preds   = out['chord'].squeeze(0).argmax(dim=-1)
+        type_preds    = out['type'].squeeze(0).argmax(dim=-1)
+        clen = chunk_mel.shape[0]
+        results = []
+        for t in range(clen):
+            if float(note_probs[t]) < note_threshold:
+                continue
+            chord_idx = int(chord_preds[t])
+            results.append({
+                'grid_pos': t + offset,
+                'fret':     int(fret_preds[t]),
+                'sustain':  SUSTAIN_TICKS.get(int(sustain_preds[t]), 0),
+                'chord':    chord_idx if chord_idx < CHORD_NO_CHORD else -1,
+                'type':     int(type_preds[t]),
+            })
+        return results
 
-    note_probs    = torch.sigmoid(out['note'].squeeze(0).squeeze(-1))
-    fret_preds    = out['fret'].squeeze(0).argmax(dim=-1)
-    sustain_preds = out['sustain'].squeeze(0).argmax(dim=-1)
-    chord_preds   = out['chord'].squeeze(0).argmax(dim=-1)
-    type_preds    = out['type'].squeeze(0).argmax(dim=-1)
+    if seq_len <= CHUNK:
+        # Short song — single pass, no chunking needed
+        return _decode_chunk(mel_tensor, offset=0)
 
+    # Long song — chunked inference with overlap
     notes = []
-    for t in range(len(note_probs)):
-        if float(note_probs[t]) < note_threshold:
-            continue
-        chord_idx = int(chord_preds[t])
-        notes.append({
-            'grid_pos': t,
-            'fret':     int(fret_preds[t]),
-            'sustain':  SUSTAIN_TICKS.get(int(sustain_preds[t]), 0),
-            'chord':    chord_idx if chord_idx < CHORD_NO_CHORD else -1,
-            'type':     int(type_preds[t]),
-        })
+    seen_positions = set()
+    start = 0
+    while start < seq_len:
+        end   = min(start + CHUNK, seq_len)
+        chunk = mel_tensor[start:end]
 
-    return notes
+        # Determine which positions in this chunk are "trusted" (not near edges)
+        local_start = GUARD if start > 0 else 0
+        local_end   = (end - start) - GUARD if end < seq_len else (end - start)
+        local_end   = max(local_end, local_start + 1)  # always keep at least 1
+
+        chunk_notes = _decode_chunk(chunk, offset=start)
+        for n in chunk_notes:
+            local_pos = n['grid_pos'] - start
+            if local_start <= local_pos < local_end:
+                if n['grid_pos'] not in seen_positions:
+                    seen_positions.add(n['grid_pos'])
+                    notes.append(n)
+
+        if end >= seq_len:
+            break
+        start += STRIDE
+
+    return sorted(notes, key=lambda x: x['grid_pos'])
 
 
 def load_model(checkpoint_path, device='cpu'):
