@@ -22,11 +22,16 @@ def _find_python():
     def _ok(p):
         """Valid only if the file exists AND is NOT inside our own app folder."""
         p = Path(str(p))
+        if not p.exists():
+            return False
         try:
-            p.relative_to(app_dir)
-            return False  # inside app folder — this is Nuitka's own python, skip it
+            # Resolve both to canonical long paths — Nuitka uses 8.3 short paths
+            # (MRSCHN~1, DOWNLO~1) which won't match app_dir's long path otherwise
+            Path(os.path.realpath(str(p))).relative_to(
+                Path(os.path.realpath(str(app_dir))))
+            return False  # inside app folder — Nuitka's own python, skip it
         except ValueError:
-            return p.exists()
+            return True
 
     # 1. Windows py launcher — lives in System32, never in app folder
     if _ok(r'C:\Windows\py.exe'):
