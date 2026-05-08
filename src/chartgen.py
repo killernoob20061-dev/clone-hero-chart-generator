@@ -86,13 +86,20 @@ _demucs_model = None
 def get_demucs():
     global _demucs_model
     if _demucs_model is None:
-        print('  Loading Demucs htdemucs...')
+        import os, pathlib
+        cache = pathlib.Path.home() / '.cache' / 'torch' / 'hub' / 'checkpoints'
+        cached = any(str(f).endswith('.th') for f in cache.glob('*')) if cache.exists() else False
+        if not cached:
+            print('  Downloading Demucs model (~200MB) — first run only, please wait...')
+        else:
+            print('  Loading Demucs htdemucs...')
         _demucs_model = get_model('htdemucs')
         _demucs_model.eval()
+        print('  Demucs loaded.')
     return _demucs_model
 
 def load_and_separate(mp3_path):
-    print('  Demucs stem separation...')
+    print('  Demucs stem separation (this takes 30-60s)...')
     y_mix, sr_mix = librosa.load(mp3_path, sr=44100, mono=False)
     if y_mix.ndim == 1:
         y_mix = np.stack([y_mix, y_mix])
