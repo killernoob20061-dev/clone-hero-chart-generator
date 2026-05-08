@@ -1,44 +1,51 @@
 """
-Clone Hero Chart Generator — GUI App
-Beautiful dark UI with drag & drop, progress tracking, and custom backgrounds.
+Clone Hero Chart Generator Suite — Full GUI App
+Tabs: Generate · Scrape · Preprocess · Train
 """
 
-import sys
-import os
-import json
-import threading
-import subprocess
-import queue
+import sys, os, json, threading, subprocess, queue, shutil, tempfile
 from pathlib import Path
 
 import customtkinter as ctk
-from tkinter import filedialog, StringVar, BooleanVar
+from tkinter import filedialog, StringVar, BooleanVar, IntVar
 import tkinter as tk
 from PIL import Image, ImageTk, ImageFilter
+
+# ── Path resolution (works both as .py and frozen .exe) ───────────────────────
+if getattr(sys, 'frozen', False):
+    APP_DIR    = Path(sys._MEIPASS)          # bundled scripts live here
+    PYTHON_EXE = shutil.which('python') or shutil.which('python3') or 'python'
+else:
+    APP_DIR    = Path(__file__).parent
+    PYTHON_EXE = sys.executable
+
+def script(name):
+    return str(APP_DIR / name)
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 ACCENT   = "#1DB954"
-BG_DARK  = "#0f0f0f"
-BG_CARD  = "#1a1a1a"
-BG_INPUT = "#242424"
-TEXT_DIM = "#888888"
-
-CONFIG_PATH = Path(__file__).parent / "app_config.json"
+BG_DARK  = "#0d0d0d"
+BG_CARD  = "#161616"
+BG_INPUT = "#1f1f1f"
+BG_SIDE  = "#111111"
+TEXT_DIM = "#666666"
+TEXT_MED = "#999999"
 
 THEMES = {
-    "Default Dark":   {"accent": "#1DB954", "bg": "#0f0f0f", "card": "#1a1a1a"},
-    "Blue Steel":     {"accent": "#4488ff", "bg": "#0a0e1a", "card": "#111827"},
-    "Purple Haze":    {"accent": "#a855f7", "bg": "#0d0a1a", "card": "#1a1428"},
-    "Fire Red":       {"accent": "#ef4444", "bg": "#120a0a", "card": "#1c1010"},
-    "Gold Rush":      {"accent": "#f59e0b", "bg": "#111009", "card": "#1c1a10"},
+    "Green (Default)": {"accent": "#1DB954", "bg": "#0d0d0d", "card": "#161616", "side": "#111111"},
+    "Blue Steel":      {"accent": "#3b82f6", "bg": "#0a0e1a", "card": "#111827", "side": "#0d1117"},
+    "Purple Haze":     {"accent": "#a855f7", "bg": "#0d0a1a", "card": "#1a1428", "side": "#110e1a"},
+    "Fire Red":        {"accent": "#ef4444", "bg": "#120a0a", "card": "#1c1010", "side": "#110d0d"},
+    "Gold Rush":       {"accent": "#f59e0b", "bg": "#111009", "card": "#1c1a10", "side": "#110f09"},
+    "Ice White":       {"accent": "#e2e8f0", "bg": "#0f0f0f", "card": "#1a1a1a", "side": "#141414"},
 }
 
-# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG_PATH = Path.home() / ".chartgen_config.json"
 
-def load_config():
+def load_cfg():
     try:
         if CONFIG_PATH.exists():
             return json.loads(CONFIG_PATH.read_text())
@@ -46,506 +53,791 @@ def load_config():
         pass
     return {}
 
-def save_config(cfg):
-    try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
-    except Exception:
-        pass
+def save_cfg(c):
+    try: CONFIG_PATH.write_text(json.dumps(c, indent=2))
+    except Exception: pass
+
+# ── Reusable widgets ──────────────────────────────────────────────────────────
+
+def label(parent, text, size=12, bold=False, color=None, **kw):
+    return ctk.CTkLabel(parent, text=text,
+        font=ctk.CTkFont(size=size, weight="bold" if bold else "normal"),
+        text_color=color or "white", **kw)
+
+def dim_label(parent, text, size=11, **kw):
+    return label(parent, text, size=size, color=TEXT_MED, **kw)
+
+def card(parent, **kw):
+    return ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=10, **kw)
+
+def btn(parent, text, command, width=120, height=34, accent=False, danger=False, **kw):
+    fg = ACCENT if accent else ("#cc3333" if danger else "#2a2a2a")
+    hv = "#17a349" if accent else ("#aa2222" if danger else "#3a3a3a")
+    tc = "black" if accent else "white"
+    return ctk.CTkButton(parent, text=text, command=command,
+        width=width, height=height,
+        fg_color=fg, hover_color=hv, text_color=tc,
+        font=ctk.CTkFont(size=12), **kw)
+
+def entry(parent, textvariable=None, placeholder="", width=None, **kw):
+    e = ctk.CTkEntry(parent, textvariable=textvariable,
+        placeholder_text=placeholder,
+        fg_color=BG_INPUT, border_color="#2a2a2a",
+        font=ctk.CTkFont(size=11), **kw)
+    if width: e.configure(width=width)
+    return e
+
+class LogBox(ctk.CTkTextbox):
+    def __init__(self, parent, **kw):
+        super().__init__(parent, fg_color=BG_CARD, corner_radius=8,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            text_color="#cccccc", wrap="word", **kw)
+        self.configure(state="disabled")
+        self._q = queue.Queue()
+        self._poll()
+
+    def log(self, msg):
+        self._q.put(msg)
+
+    def clear(self):
+        self.configure(state="normal")
+        self.delete("1.0", "end")
+        self.configure(state="disabled")
+
+    def _poll(self):
+        try:
+            while True:
+                msg = self._q.get_nowait()
+                self.configure(state="normal")
+                self.insert("end", msg + "\n")
+                self.see("end")
+                self.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(80, self._poll)
+
+
+def run_script(args, logbox, on_done=None, on_start=None):
+    """Run a python script in a background thread, streaming output to logbox."""
+    def _run():
+        if on_start: on_start()
+        cmd = [PYTHON_EXE] + args
+        logbox.log("$ " + " ".join(str(a) for a in args))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line: logbox.log(line)
+            proc.wait()
+            logbox.log(f"\n{'✅ Done' if proc.returncode == 0 else '❌ Failed (exit ' + str(proc.returncode) + ')'}")
+        except Exception as e:
+            logbox.log(f"❌ Error: {e}")
+        if on_done: on_done()
+    threading.Thread(target=_run, daemon=True).start()
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 
-class ChartGenApp(ctk.CTk):
+class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-
-        self.cfg = load_config()
-        self.songs: list[str] = []
-        self.log_queue = queue.Queue()
-        self.running = False
-        self._bg_image_ref = None
-        self._bg_label = None
-
-        # Apply saved theme
-        self._current_theme = self.cfg.get("theme", "Default Dark")
-        self._apply_theme(self._current_theme, rebuild=False)
-
+        self.cfg = load_cfg()
+        self._apply_theme(self.cfg.get("theme", "Green (Default)"), init=True)
         self.title("Clone Hero Chart Generator")
-        self.geometry("860x720")
-        self.minsize(700, 600)
+        self.geometry("980x700")
+        self.minsize(820, 580)
         self.configure(fg_color=BG_DARK)
-
-        self._build_ui()
-        self._apply_bg_image(self.cfg.get("bg_image", ""))
-        self._poll_log()
-        self.bind("<Configure>", self._on_resize)
+        self._bg_ref = None
+        self._bg_lbl = None
+        self._active_tab = None
+        self._build()
+        self._load_bg()
+        self.bind("<Configure>", lambda e: self._resize_bg() if e.widget == self else None)
 
     # ── Theme ─────────────────────────────────────────────────────────────────
-
-    def _apply_theme(self, name, rebuild=True):
-        global ACCENT, BG_DARK, BG_CARD, BG_INPUT
-        t = THEMES.get(name, THEMES["Default Dark"])
-        ACCENT   = t["accent"]
-        BG_DARK  = t["bg"]
-        BG_CARD  = t["card"]
-        self._current_theme = name
+    def _apply_theme(self, name, init=False):
+        global ACCENT, BG_DARK, BG_CARD, BG_INPUT, BG_SIDE
+        t = THEMES.get(name, THEMES["Green (Default)"])
+        ACCENT = t["accent"]; BG_DARK = t["bg"]
+        BG_CARD = t["card"]; BG_SIDE = t["side"]
         self.cfg["theme"] = name
-        save_config(self.cfg)
-        if rebuild:
+        save_cfg(self.cfg)
+        if not init:
             self.configure(fg_color=BG_DARK)
-            self._rebuild_ui()
+            for w in self.winfo_children(): w.destroy()
+            self._bg_lbl = None
+            self._build()
+            self._load_bg()
 
-    def _rebuild_ui(self):
-        for w in self.winfo_children():
-            w.destroy()
-        self._bg_label = None
-        self._build_ui()
-        self._apply_bg_image(self.cfg.get("bg_image", ""))
+    # ── Background ────────────────────────────────────────────────────────────
+    def _load_bg(self):
+        self._apply_bg(self.cfg.get("bg_image", ""))
 
-    # ── Background Image ──────────────────────────────────────────────────────
-
-    def _apply_bg_image(self, path):
+    def _apply_bg(self, path):
         if not path or not os.path.exists(path):
-            if self._bg_label:
-                self._bg_label.destroy()
-                self._bg_label = None
+            if self._bg_lbl: self._bg_lbl.destroy(); self._bg_lbl = None
             return
         try:
-            img = Image.open(path)
-            w, h = self.winfo_width() or 860, self.winfo_height() or 720
-            img = img.resize((w, h), Image.LANCZOS)
-            img = img.filter(ImageFilter.GaussianBlur(radius=8))
-            # Darken overlay
-            overlay = Image.new("RGBA", img.size, (0, 0, 0, 160))
-            img = img.convert("RGBA")
-            img = Image.alpha_composite(img, overlay).convert("RGB")
-            self._bg_image_ref = ImageTk.PhotoImage(img)
-            if not self._bg_label:
-                self._bg_label = tk.Label(self, image=self._bg_image_ref)
-                self._bg_label.place(x=0, y=0, relwidth=1, relheight=1)
-                self._bg_label.lower()
+            w, h = max(self.winfo_width(), 980), max(self.winfo_height(), 700)
+            img = Image.open(path).resize((w, h), Image.LANCZOS)
+            img = img.filter(ImageFilter.GaussianBlur(10))
+            ov  = Image.new("RGBA", img.size, (0,0,0,170))
+            img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+            self._bg_ref = ImageTk.PhotoImage(img)
+            if not self._bg_lbl:
+                self._bg_lbl = tk.Label(self, image=self._bg_ref)
+                self._bg_lbl.place(x=0, y=0, relwidth=1, relheight=1)
+                self._bg_lbl.lower()
             else:
-                self._bg_label.configure(image=self._bg_image_ref)
-        except Exception as e:
-            print(f"BG image error: {e}")
+                self._bg_lbl.configure(image=self._bg_ref)
+        except Exception: pass
 
-    def _on_resize(self, event):
-        if self.cfg.get("bg_image") and event.widget == self:
-            self.after(150, lambda: self._apply_bg_image(self.cfg.get("bg_image", "")))
+    def _resize_bg(self):
+        if self.cfg.get("bg_image"):
+            self.after(200, lambda: self._apply_bg(self.cfg.get("bg_image","")))
 
-    def _browse_bg(self):
-        f = filedialog.askopenfilename(
-            title="Select background image",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All", "*.*")]
-        )
-        if f:
-            self.cfg["bg_image"] = f
-            save_config(self.cfg)
-            self._apply_bg_image(f)
+    # ── Build UI ──────────────────────────────────────────────────────────────
+    def _build(self):
+        # ── Sidebar ───────────────────────────────────────────────────────────
+        self.sidebar = ctk.CTkFrame(self, fg_color=BG_SIDE, corner_radius=0, width=200)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
 
-    def _clear_bg(self):
-        self.cfg["bg_image"] = ""
-        save_config(self.cfg)
-        if self._bg_label:
-            self._bg_label.destroy()
-            self._bg_label = None
+        # Logo
+        logo = ctk.CTkFrame(self.sidebar, fg_color="transparent", height=70)
+        logo.pack(fill="x")
+        logo.pack_propagate(False)
+        label(logo, "🎸", size=24).pack(side="left", padx=(16,6), pady=18)
+        f = ctk.CTkFrame(logo, fg_color="transparent")
+        f.pack(side="left", pady=18)
+        label(f, "ChartGen", size=15, bold=True, color=ACCENT).pack(anchor="w")
+        dim_label(f, "Clone Hero Suite").pack(anchor="w")
 
-    # ── UI Construction ───────────────────────────────────────────────────────
+        ctk.CTkFrame(self.sidebar, fg_color="#222222", height=1).pack(fill="x", padx=12)
 
-    def _build_ui(self):
-        # Title bar
-        title_frame = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=60)
-        title_frame.pack(fill="x")
-        title_frame.pack_propagate(False)
+        # Nav buttons
+        self._nav_btns = {}
+        nav_items = [
+            ("🎸  Generate",    "generate"),
+            ("📥  Scrape",      "scrape"),
+            ("⚙️  Preprocess",  "preprocess"),
+            ("🧠  Train",       "train"),
+        ]
+        nav_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        nav_frame.pack(fill="x", pady=12, padx=8)
 
-        ctk.CTkLabel(
-            title_frame, text="🎸  Clone Hero Chart Generator",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            text_color=ACCENT
-        ).pack(side="left", padx=20, pady=15)
+        for text, key in nav_items:
+            b = ctk.CTkButton(nav_frame, text=text,
+                font=ctk.CTkFont(size=13),
+                anchor="w", height=42, corner_radius=8,
+                fg_color="transparent", hover_color="#222222",
+                text_color=TEXT_MED,
+                command=lambda k=key: self._switch_tab(k))
+            b.pack(fill="x", pady=2)
+            self._nav_btns[key] = b
 
-        ctk.CTkLabel(
-            title_frame, text="v6 + ChartNet Neural",
-            font=ctk.CTkFont(size=11), text_color=TEXT_DIM
-        ).pack(side="left", pady=15)
+        # Bottom settings button
+        ctk.CTkFrame(self.sidebar, fg_color="#222222", height=1).pack(fill="x", padx=12, side="bottom", pady=(0,60))
+        ctk.CTkButton(self.sidebar, text="⚙  Appearance",
+            font=ctk.CTkFont(size=12), anchor="w", height=36,
+            fg_color="transparent", hover_color="#222222", text_color=TEXT_MED,
+            corner_radius=8, command=self._open_appearance
+        ).pack(side="bottom", fill="x", padx=8, pady=(0,8))
 
-        # Settings gear button
-        ctk.CTkButton(
-            title_frame, text="⚙", width=36, height=36,
-            fg_color="transparent", hover_color="#333333",
-            font=ctk.CTkFont(size=18),
-            command=self._open_settings
-        ).pack(side="right", padx=10)
+        # ── Content area ──────────────────────────────────────────────────────
+        self.content = ctk.CTkFrame(self, fg_color="transparent")
+        self.content.pack(side="right", fill="both", expand=True)
 
-        # Main content
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=20, pady=15)
+        # Build all tabs
+        self._tabs = {
+            "generate":   GenerateTab(self.content, self.cfg),
+            "scrape":     ScrapeTab(self.content, self.cfg),
+            "preprocess": PreprocessTab(self.content, self.cfg),
+            "train":      TrainTab(self.content, self.cfg),
+        }
+        self._switch_tab("generate")
 
-        left = ctk.CTkFrame(content, fg_color="transparent")
-        left.pack(side="left", fill="both", expand=True, padx=(0, 10))
+    def _switch_tab(self, key):
+        if self._active_tab:
+            self._tabs[self._active_tab].pack_forget()
+            self._nav_btns[self._active_tab].configure(
+                fg_color="transparent", text_color=TEXT_MED)
+        self._active_tab = key
+        self._tabs[key].pack(fill="both", expand=True)
+        self._nav_btns[key].configure(fg_color="#222222", text_color=ACCENT)
 
-        right = ctk.CTkFrame(content, fg_color="transparent", width=240)
-        right.pack(side="right", fill="y")
-        right.pack_propagate(False)
-
-        self._build_drop_zone(left)
-        self._build_song_list(left)
-        self._build_settings_panel(right)
-        self._build_bottom()
-
-    def _build_drop_zone(self, parent):
-        self.drop_frame = ctk.CTkFrame(
-            parent, fg_color=BG_CARD, corner_radius=12,
-            border_width=2, border_color="#333333", height=110
-        )
-        self.drop_frame.pack(fill="x", pady=(0, 10))
-        self.drop_frame.pack_propagate(False)
-
-        self.drop_frame.bind("<Button-1>", lambda e: self._browse_songs())
-        self.drop_frame.bind("<Enter>", lambda e: self.drop_frame.configure(border_color=ACCENT))
-        self.drop_frame.bind("<Leave>", lambda e: self.drop_frame.configure(border_color="#333333"))
-
-        inner = ctk.CTkFrame(self.drop_frame, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        ctk.CTkLabel(inner, text="🎵", font=ctk.CTkFont(size=28)).pack()
-        ctk.CTkLabel(inner, text="Click to add MP3 files",
-            font=ctk.CTkFont(size=14, weight="bold"), text_color="white").pack()
-        ctk.CTkLabel(inner, text="Batch generation supported",
-            font=ctk.CTkFont(size=11), text_color=TEXT_DIM).pack()
-
-        for w in inner.winfo_children():
-            w.bind("<Button-1>", lambda e: self._browse_songs())
-
-    def _build_song_list(self, parent):
-        header = ctk.CTkFrame(parent, fg_color="transparent")
-        header.pack(fill="x", pady=(0, 5))
-        ctk.CTkLabel(header, text="Songs", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
-        ctk.CTkButton(header, text="Clear all", width=65, height=24,
-            font=ctk.CTkFont(size=11), fg_color="#333333", hover_color="#444444",
-            command=self._clear_songs).pack(side="right")
-
-        self.song_list_frame = ctk.CTkScrollableFrame(
-            parent, fg_color=BG_CARD, corner_radius=10, height=160)
-        self.song_list_frame.pack(fill="x", pady=(0, 10))
-
-        self.empty_label = ctk.CTkLabel(self.song_list_frame,
-            text="No songs added yet", text_color=TEXT_DIM, font=ctk.CTkFont(size=12))
-        self.empty_label.pack(pady=20)
-
-        ctk.CTkLabel(parent, text="Output Log",
-            font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(5, 5))
-
-        self.log_box = ctk.CTkTextbox(
-            parent, fg_color=BG_CARD, corner_radius=10,
-            font=ctk.CTkFont(family="Consolas", size=11),
-            text_color="#cccccc", height=180, wrap="word")
-        self.log_box.pack(fill="both", expand=True)
-        self.log_box.configure(state="disabled")
-
-    def _build_settings_panel(self, parent):
-        ctk.CTkLabel(parent, text="Settings",
-            font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(0, 10))
-
-        # Output folder
-        self._setting_label(parent, "Output Folder")
-        self.out_var = StringVar(value=self.cfg.get("out_folder",
-            str(Path.home() / "Desktop" / "Charts")))
-        out_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        out_frame.pack(fill="x", pady=(0, 12))
-        ctk.CTkEntry(out_frame, textvariable=self.out_var,
-            fg_color=BG_INPUT, border_color="#333333",
-            font=ctk.CTkFont(size=10), height=30).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(out_frame, text="📁", width=30, height=30,
-            fg_color=BG_INPUT, hover_color="#333333",
-            command=self._browse_out).pack(side="right", padx=(4, 0))
-
-        # Model
-        self._setting_label(parent, "Neural Model (optional)")
-        self.model_var = StringVar(value=self.cfg.get("model_path", ""))
-        model_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        model_frame.pack(fill="x", pady=(0, 12))
-        ctk.CTkEntry(model_frame, textvariable=self.model_var,
-            placeholder_text="Algorithmic only",
-            fg_color=BG_INPUT, border_color="#333333",
-            font=ctk.CTkFont(size=10), height=30).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(model_frame, text="📁", width=30, height=30,
-            fg_color=BG_INPUT, hover_color="#333333",
-            command=self._browse_model).pack(side="right", padx=(4, 0))
-
-        # Frets
-        self._setting_label(parent, "Fret Palette")
-        self.frets_var = StringVar(value=self.cfg.get("frets", "0,1,2,3,4"))
-        fret_presets = [("GRY", "0,1,2"), ("All 5", "0,1,2,3,4")]
-        self._fret_btns = {}
-        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(0, 4))
-        for label, val in fret_presets:
-            active = self.frets_var.get() == val
-            btn = ctk.CTkButton(btn_row, text=label, height=26,
-                font=ctk.CTkFont(size=11),
-                fg_color=ACCENT if active else "#333333",
-                hover_color="#555555",
-                command=lambda v=val, l=label: self._set_frets(v, l))
-            btn.pack(side="left", padx=(0, 4))
-            self._fret_btns[label] = btn
-        ctk.CTkEntry(parent, textvariable=self.frets_var,
-            fg_color=BG_INPUT, border_color="#333333",
-            font=ctk.CTkFont(size=11), height=28).pack(fill="x", pady=(0, 12))
-
-        # Options
-        self._setting_label(parent, "Options")
-        self.lyrics_var = BooleanVar(value=self.cfg.get("lyrics", False))
-        ctk.CTkSwitch(parent, text="Whisper Lyrics (slow)",
-            variable=self.lyrics_var,
-            font=ctk.CTkFont(size=12),
-            progress_color=ACCENT).pack(anchor="w", pady=(0, 4))
-
-    def _build_bottom(self):
-        bottom = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=85)
-        bottom.pack(fill="x", side="bottom")
-        bottom.pack_propagate(False)
-
-        inner = ctk.CTkFrame(bottom, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        self.progress = ctk.CTkProgressBar(inner, width=420, height=8,
-            progress_color=ACCENT, fg_color="#333333")
-        self.progress.pack(pady=(0, 8))
-        self.progress.set(0)
-
-        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
-        btn_row.pack()
-
-        self.gen_btn = ctk.CTkButton(btn_row, text="⚡  Generate Charts",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            height=42, width=220,
-            fg_color=ACCENT, hover_color="#17a349",
-            text_color="black",
-            command=self._generate)
-        self.gen_btn.pack(side="left", padx=(0, 10))
-
-        ctk.CTkButton(btn_row, text="📂  Open Output",
-            font=ctk.CTkFont(size=13), height=42, width=140,
-            fg_color="#333333", hover_color="#444444",
-            command=self._open_output).pack(side="left")
-
-        self.status_label = ctk.CTkLabel(inner, text="Ready",
-            font=ctk.CTkFont(size=11), text_color=TEXT_DIM)
-        self.status_label.pack(pady=(6, 0))
-
-    # ── Settings Window ───────────────────────────────────────────────────────
-
-    def _open_settings(self):
+    # ── Appearance window ─────────────────────────────────────────────────────
+    def _open_appearance(self):
         win = ctk.CTkToplevel(self)
-        win.title("Appearance Settings")
-        win.geometry("400x460")
+        win.title("Appearance")
+        win.geometry("420x500")
         win.configure(fg_color=BG_DARK)
         win.grab_set()
 
-        ctk.CTkLabel(win, text="🎨  Appearance",
-            font=ctk.CTkFont(size=18, weight="bold"),
-            text_color=ACCENT).pack(pady=(20, 15))
+        label(win, "🎨  Appearance", size=18, bold=True, color=ACCENT).pack(pady=(20,15), padx=20, anchor="w")
 
-        # Theme selector
-        ctk.CTkLabel(win, text="Theme", font=ctk.CTkFont(size=12),
-            text_color=TEXT_DIM).pack(anchor="w", padx=20)
-
-        theme_frame = ctk.CTkFrame(win, fg_color="transparent")
-        theme_frame.pack(fill="x", padx=20, pady=(4, 16))
+        # Themes
+        dim_label(win, "COLOR THEME").pack(anchor="w", padx=20)
+        tf = ctk.CTkScrollableFrame(win, fg_color="transparent", height=230)
+        tf.pack(fill="x", padx=20, pady=(4,16))
 
         for name, t in THEMES.items():
-            row = ctk.CTkFrame(theme_frame, fg_color=BG_CARD, corner_radius=8)
+            row = card(tf, height=42)
             row.pack(fill="x", pady=3)
-
+            row.pack_propagate(False)
             ctk.CTkLabel(row, text="●", text_color=t["accent"],
-                font=ctk.CTkFont(size=16)).pack(side="left", padx=(10, 6), pady=8)
-            ctk.CTkLabel(row, text=name,
-                font=ctk.CTkFont(size=13, weight="bold" if name == self._current_theme else "normal")
-            ).pack(side="left", pady=8)
-
-            if name == self._current_theme:
-                ctk.CTkLabel(row, text="✓ Active",
-                    text_color=ACCENT, font=ctk.CTkFont(size=11)).pack(side="right", padx=10)
+                font=ctk.CTkFont(size=20)).pack(side="left", padx=(12,8))
+            label(row, name, size=13,
+                bold=(name==self.cfg.get("theme"))).pack(side="left")
+            if name == self.cfg.get("theme","Green (Default)"):
+                label(row, "✓", size=13, color=ACCENT).pack(side="right", padx=12)
             else:
-                ctk.CTkButton(row, text="Apply", width=60, height=26,
-                    font=ctk.CTkFont(size=11),
-                    fg_color="#333333", hover_color=t["accent"],
+                btn(row, "Apply", width=60, height=28, accent=False,
                     command=lambda n=name, w=win: (self._apply_theme(n), w.destroy())
                 ).pack(side="right", padx=8)
 
         # Background image
-        ctk.CTkLabel(win, text="Background Image",
-            font=ctk.CTkFont(size=12), text_color=TEXT_DIM).pack(anchor="w", padx=20, pady=(0, 4))
+        dim_label(win, "BACKGROUND IMAGE").pack(anchor="w", padx=20)
+        bg_card = card(win, height=50)
+        bg_card.pack(fill="x", padx=20, pady=(4,4))
+        bg_card.pack_propagate(False)
+        cur = self.cfg.get("bg_image","")
+        label(bg_card, f"📷  {Path(cur).name if cur else 'No image'}",
+            size=11, color=TEXT_MED if not cur else "white").pack(side="left", padx=12)
+        bf = ctk.CTkFrame(bg_card, fg_color="transparent")
+        bf.pack(side="right", padx=8)
+        btn(bf, "Choose", width=65, height=28, accent=True,
+            command=lambda w=win: self._pick_bg(w)).pack(side="left", padx=2)
+        btn(bf, "Clear", width=50, height=28, danger=True,
+            command=lambda w=win: self._clear_bg(w)).pack(side="left", padx=2)
+        dim_label(win, "Auto-blurred and darkened for readability").pack(padx=20, pady=(2,0))
 
-        bg_frame = ctk.CTkFrame(win, fg_color=BG_CARD, corner_radius=8)
-        bg_frame.pack(fill="x", padx=20, pady=(0, 10))
+    def _pick_bg(self, win):
+        f = filedialog.askopenfilename(title="Background image",
+            filetypes=[("Images","*.jpg *.jpeg *.png *.bmp *.webp"),("All","*.*")])
+        if f:
+            self.cfg["bg_image"] = f
+            save_cfg(self.cfg)
+            self._apply_bg(f)
+            win.destroy()
 
-        current_bg = self.cfg.get("bg_image", "")
-        bg_text = Path(current_bg).name if current_bg else "No image set"
-        ctk.CTkLabel(bg_frame, text=f"📷  {bg_text}",
-            font=ctk.CTkFont(size=11), text_color=TEXT_DIM if not current_bg else "white"
-        ).pack(side="left", padx=12, pady=10)
+    def _clear_bg(self, win):
+        self.cfg["bg_image"] = ""
+        save_cfg(self.cfg)
+        if self._bg_lbl: self._bg_lbl.destroy(); self._bg_lbl = None
+        win.destroy()
 
-        btn_f = ctk.CTkFrame(bg_frame, fg_color="transparent")
-        btn_f.pack(side="right", padx=8)
-        ctk.CTkButton(btn_f, text="Choose", width=65, height=28,
-            fg_color=ACCENT, hover_color="#17a349", text_color="black",
-            command=lambda w=win: (self._browse_bg(), w.destroy())).pack(side="left", padx=2)
-        ctk.CTkButton(btn_f, text="Clear", width=50, height=28,
-            fg_color="#333333", hover_color="#cc3333",
-            command=lambda w=win: (self._clear_bg(), w.destroy())).pack(side="left", padx=2)
 
-        ctk.CTkLabel(win, text="Images are auto-blurred and darkened for readability",
-            font=ctk.CTkFont(size=10), text_color=TEXT_DIM).pack(pady=(0, 10))
+# ── Base Tab ──────────────────────────────────────────────────────────────────
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+class BaseTab(ctk.CTkFrame):
+    def __init__(self, parent, cfg, title, subtitle, icon):
+        super().__init__(parent, fg_color="transparent")
+        self.cfg = cfg
+        self._running = False
 
-    def _setting_label(self, parent, text):
-        ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=11),
-            text_color=TEXT_DIM).pack(anchor="w", pady=(0, 3))
+        # Header
+        hdr = ctk.CTkFrame(self, fg_color="transparent", height=64)
+        hdr.pack(fill="x", padx=24, pady=(18,0))
+        hdr.pack_propagate(False)
+        label(hdr, f"{icon}  {title}", size=22, bold=True, color=ACCENT).pack(side="left", anchor="s", pady=8)
+        dim_label(hdr, subtitle).pack(side="left", anchor="s", padx=10, pady=10)
 
-    def _set_frets(self, val, label):
-        self.frets_var.set(val)
+        ctk.CTkFrame(self, fg_color="#222222", height=1).pack(fill="x", padx=24, pady=(8,16))
+
+    def _lock(self):   self._running = True
+    def _unlock(self): self._running = False
+
+
+# ── GENERATE TAB ──────────────────────────────────────────────────────────────
+
+class GenerateTab(BaseTab):
+    def __init__(self, parent, cfg):
+        super().__init__(parent, cfg, "Generate Charts", "MP3 → Clone Hero .chart files", "🎸")
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=0)
+
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(0,16))
+        right = ctk.CTkFrame(body, fg_color="transparent", width=240)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        # Drop zone
+        drop = card(left, height=100, border_width=2, border_color="#2a2a2a")
+        drop.pack(fill="x", pady=(0,12))
+        drop.pack_propagate(False)
+        drop.bind("<Button-1>", lambda e: self._browse())
+        drop.bind("<Enter>",    lambda e: drop.configure(border_color=ACCENT))
+        drop.bind("<Leave>",    lambda e: drop.configure(border_color="#2a2a2a"))
+        inner = ctk.CTkFrame(drop, fg_color="transparent")
+        inner.place(relx=.5, rely=.5, anchor="center")
+        label(inner, "🎵", size=26).pack()
+        label(inner, "Click to add MP3 / audio files", size=13, bold=True).pack()
+        dim_label(inner, "Supports batch — multiple songs at once").pack()
+        for w in inner.winfo_children(): w.bind("<Button-1>", lambda e: self._browse())
+
+        # Song list
+        sh = ctk.CTkFrame(left, fg_color="transparent")
+        sh.pack(fill="x", pady=(0,6))
+        label(sh, "Songs", size=13, bold=True).pack(side="left")
+        btn(sh, "Clear all", self._clear, width=70, height=26).pack(side="right")
+
+        self.song_list = ctk.CTkScrollableFrame(left, fg_color=BG_CARD, corner_radius=8, height=140)
+        self.song_list.pack(fill="x", pady=(0,12))
+        self._songs = []
+        self._refresh_list()
+
+        # Log
+        label(left, "Output Log", size=13, bold=True).pack(anchor="w", pady=(0,6))
+        self.log = LogBox(left, height=160)
+        self.log.pack(fill="both", expand=True)
+
+        # Settings panel (right)
+        label(right, "Settings", size=14, bold=True).pack(anchor="w", pady=(0,12))
+        self._out_var   = self._folder_row(right, "Output Folder",
+            cfg.get("gen_out", str(Path.home()/"Desktop"/"Charts")), self._browse_out)
+        self._model_var = self._file_row(right, "Neural Model (optional)",
+            cfg.get("model_path",""), "*.pt", self._browse_model)
+        self._frets_var, self._fret_btns = self._fret_row(right, cfg.get("frets","0,1,2,3,4"))
+        dim_label(right, "OPTIONS").pack(anchor="w", pady=(8,4))
+        self._lyrics_var = BooleanVar(value=cfg.get("lyrics", False))
+        ctk.CTkSwitch(right, text="Whisper Lyrics (slow)", variable=self._lyrics_var,
+            font=ctk.CTkFont(size=12), progress_color=ACCENT).pack(anchor="w")
+
+        # Bottom bar
+        self._build_bottom()
+
+    def _build_bottom(self):
+        bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=76)
+        bar.pack(fill="x", side="bottom")
+        bar.pack_propagate(False)
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.place(relx=.5, rely=.5, anchor="center")
+        self.progress = ctk.CTkProgressBar(inner, width=460, height=6,
+            progress_color=ACCENT, fg_color="#2a2a2a")
+        self.progress.pack(pady=(0,8))
+        self.progress.set(0)
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack()
+        self.gen_btn = btn(row, "⚡  Generate Charts", self._generate,
+            width=200, height=40, accent=True)
+        self.gen_btn.configure(font=ctk.CTkFont(size=14, weight="bold"))
+        self.gen_btn.pack(side="left", padx=(0,10))
+        btn(row, "📂  Open Output", self._open_out, width=140, height=40).pack(side="left")
+        self.status_lbl = dim_label(inner, "Ready")
+        self.status_lbl.pack(pady=(6,0))
+
+    def _folder_row(self, parent, title, default, browse_cmd):
+        dim_label(parent, title.upper()).pack(anchor="w", pady=(0,3))
+        var = StringVar(value=default)
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(0,10))
+        entry(row, textvariable=var, height=30).pack(side="left", fill="x", expand=True)
+        btn(row, "📁", browse_cmd, width=30, height=30).pack(side="right", padx=(4,0))
+        return var
+
+    def _file_row(self, parent, title, default, ext, browse_cmd):
+        dim_label(parent, title.upper()).pack(anchor="w", pady=(0,3))
+        var = StringVar(value=default)
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(0,10))
+        entry(row, textvariable=var, placeholder="Not set", height=30).pack(side="left", fill="x", expand=True)
+        btn(row, "📁", browse_cmd, width=30, height=30).pack(side="right", padx=(4,0))
+        return var
+
+    def _fret_row(self, parent, default):
+        dim_label(parent, "FRET PALETTE").pack(anchor="w", pady=(0,3))
+        var  = StringVar(value=default)
+        btns = {}
+        row  = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(0,4))
+        for lbl, val in [("GRY","0,1,2"),("All 5","0,1,2,3,4")]:
+            active = var.get() == val
+            b = ctk.CTkButton(row, text=lbl, height=28,
+                font=ctk.CTkFont(size=11),
+                fg_color=ACCENT if active else "#2a2a2a",
+                hover_color="#3a3a3a",
+                command=lambda v=val, l=lbl: self._set_frets(v, l, var, btns))
+            b.pack(side="left", padx=(0,4))
+            btns[lbl] = b
+        entry(parent, textvariable=var, height=28).pack(fill="x", pady=(0,10))
+        return var, btns
+
+    def _set_frets(self, val, lbl, var, btns):
+        var.set(val)
         self.cfg["frets"] = val
-        save_config(self.cfg)
-        for l, btn in self._fret_btns.items():
-            btn.configure(fg_color=ACCENT if l == label else "#333333")
+        save_cfg(self.cfg)
+        for l, b in btns.items():
+            b.configure(fg_color=ACCENT if l==lbl else "#2a2a2a")
 
-    def _browse_songs(self):
+    def _refresh_list(self):
+        for w in self.song_list.winfo_children(): w.destroy()
+        if not self._songs:
+            dim_label(self.song_list, "No songs added yet").pack(pady=16)
+            return
+        for i, p in enumerate(self._songs):
+            row = ctk.CTkFrame(self.song_list, fg_color="#1e1e1e", corner_radius=6)
+            row.pack(fill="x", pady=2, padx=4)
+            label(row, f"🎵  {Path(p).name}", size=12, anchor="w"
+                ).pack(side="left", padx=10, pady=6, fill="x", expand=True)
+            btn(row, "✕", lambda i=i: self._remove(i),
+                width=26, height=26, danger=True).pack(side="right", padx=6)
+
+    def _browse(self):
         files = filedialog.askopenfilenames(title="Select audio files",
-            filetypes=[("Audio", "*.mp3 *.ogg *.wav *.flac"), ("All", "*.*")])
+            filetypes=[("Audio","*.mp3 *.ogg *.wav *.flac"),("All","*.*")])
         for f in files:
-            if f not in self.songs:
-                self.songs.append(f)
-        self._refresh_song_list()
+            if f not in self._songs: self._songs.append(f)
+        self._refresh_list()
+
+    def _remove(self, i):
+        if 0 <= i < len(self._songs): self._songs.pop(i); self._refresh_list()
+
+    def _clear(self): self._songs.clear(); self._refresh_list()
 
     def _browse_out(self):
-        d = filedialog.askdirectory(title="Select output folder")
-        if d:
-            self.out_var.set(d)
-            self.cfg["out_folder"] = d
-            save_config(self.cfg)
+        d = filedialog.askdirectory()
+        if d: self._out_var.set(d); self.cfg["gen_out"]=d; save_cfg(self.cfg)
 
     def _browse_model(self):
-        f = filedialog.askopenfilename(title="Select ChartNet checkpoint",
-            filetypes=[("Checkpoint", "*.pt"), ("All", "*.*")])
-        if f:
-            self.model_var.set(f)
-            self.cfg["model_path"] = f
-            save_config(self.cfg)
+        f = filedialog.askopenfilename(filetypes=[("Checkpoint","*.pt"),("All","*.*")])
+        if f: self._model_var.set(f); self.cfg["model_path"]=f; save_cfg(self.cfg)
 
-    def _clear_songs(self):
-        self.songs.clear()
-        self._refresh_song_list()
-
-    def _refresh_song_list(self):
-        for w in self.song_list_frame.winfo_children():
-            w.destroy()
-        if not self.songs:
-            ctk.CTkLabel(self.song_list_frame, text="No songs added yet",
-                text_color=TEXT_DIM, font=ctk.CTkFont(size=12)).pack(pady=20)
-            return
-        for i, path in enumerate(self.songs):
-            row = ctk.CTkFrame(self.song_list_frame, fg_color="#222222", corner_radius=6)
-            row.pack(fill="x", pady=2, padx=4)
-            ctk.CTkLabel(row, text=f"🎵  {Path(path).name}",
-                font=ctk.CTkFont(size=12), anchor="w"
-            ).pack(side="left", padx=10, pady=6, fill="x", expand=True)
-            ctk.CTkButton(row, text="✕", width=26, height=26,
-                fg_color="transparent", hover_color="#cc3333",
-                font=ctk.CTkFont(size=12),
-                command=lambda i=i: self._remove_song(i)).pack(side="right", padx=6)
-
-    def _remove_song(self, idx):
-        if 0 <= idx < len(self.songs):
-            self.songs.pop(idx)
-            self._refresh_song_list()
-
-    def _open_output(self):
-        out = self.out_var.get()
-        if os.path.exists(out):
-            os.startfile(out)
-
-    def _log(self, msg):
-        self.log_queue.put(msg)
-
-    def _poll_log(self):
-        try:
-            while True:
-                msg = self.log_queue.get_nowait()
-                self.log_box.configure(state="normal")
-                self.log_box.insert("end", msg + "\n")
-                self.log_box.see("end")
-                self.log_box.configure(state="disabled")
-        except queue.Empty:
-            pass
-        self.after(100, self._poll_log)
-
-    # ── Generation ────────────────────────────────────────────────────────────
+    def _open_out(self):
+        p = self._out_var.get()
+        if os.path.exists(p): os.startfile(p)
 
     def _generate(self):
-        if self.running:
-            return
-        if not self.songs:
-            self._log("⚠  No songs added. Click the drop zone to add MP3 files.")
-            return
-        self.running = True
+        if self._running: return
+        if not self._songs: self.log.log("⚠  No songs added."); return
+        self._lock()
         self.gen_btn.configure(state="disabled", text="⏳  Generating...")
         self.progress.set(0)
-        self.status_label.configure(text="Starting...")
-        threading.Thread(target=self._run_generation, daemon=True).start()
+        songs = list(self._songs)
 
-    def _run_generation(self):
-        songs  = list(self.songs)
-        total  = len(songs)
-        out    = self.out_var.get()
-        model  = self.model_var.get()
-        frets  = self.frets_var.get()
-        lyrics = self.lyrics_var.get()
+        def run():
+            for i, song in enumerate(songs):
+                self.status_lbl.configure(text=f"Processing {i+1}/{len(songs)}: {Path(song).name}")
+                cmd = [script("chartgen.py"), "--out", self._out_var.get(),
+                       "--frets", self._frets_var.get()]
+                if not self._lyrics_var.get(): cmd.append("--no-lyrics")
+                if self._model_var.get(): cmd += ["--model", self._model_var.get()]
+                cmd.append(song)
+                self.log.log(f"\n[{i+1}/{len(songs)}] {Path(song).name}")
+                try:
+                    proc = subprocess.Popen([PYTHON_EXE]+[script("chartgen.py")]+cmd[1:],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    for line in proc.stdout:
+                        if line.strip(): self.log.log("  " + line.rstrip())
+                    proc.wait()
+                    self.log.log("✅ Done" if proc.returncode==0 else f"❌ Failed")
+                except Exception as e:
+                    self.log.log(f"❌ {e}")
+                self.progress.set((i+1)/len(songs))
+            self.gen_btn.configure(state="normal", text="⚡  Generate Charts")
+            self.status_lbl.configure(text=f"Done! {len(songs)} chart(s)")
+            self._unlock()
 
-        os.makedirs(out, exist_ok=True)
+        threading.Thread(target=run, daemon=True).start()
 
-        for i, song in enumerate(songs):
-            name = Path(song).name
-            self._log(f"\n{'─'*38}")
-            self._log(f"[{i+1}/{total}]  {name}")
-            self.after(0, lambda i=i, name=name: self.status_label.configure(
-                text=f"Processing {i+1}/{total}: {name}"))
 
-            cmd = [sys.executable, "chartgen.py", "--out", out, "--frets", frets]
-            if not lyrics:
-                cmd.append("--no-lyrics")
-            if model:
-                cmd += ["--model", model]
-            cmd.append(song)
+# ── SCRAPE TAB ────────────────────────────────────────────────────────────────
 
+class ScrapeTab(BaseTab):
+    def __init__(self, parent, cfg):
+        super().__init__(parent, cfg, "Scrape Dataset", "Download chart+audio pairs from Enchor", "📥")
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24)
+
+        left  = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(0,16))
+        right = ctk.CTkFrame(body, fg_color="transparent", width=260)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        label(left, "Output Log", size=13, bold=True).pack(anchor="w", pady=(0,6))
+        self.log = LogBox(left)
+        self.log.pack(fill="both", expand=True)
+
+        # Right panel settings
+        label(right, "Scrape Settings", size=14, bold=True).pack(anchor="w", pady=(0,12))
+
+        dim_label(right, "OUTPUT FOLDER").pack(anchor="w", pady=(0,3))
+        self._out_var = StringVar(value=cfg.get("scrape_out", "./dataset"))
+        row = ctk.CTkFrame(right, fg_color="transparent")
+        row.pack(fill="x", pady=(0,12))
+        entry(row, textvariable=self._out_var, height=30).pack(side="left", fill="x", expand=True)
+        btn(row, "📁", self._browse_out, width=30, height=30).pack(side="right", padx=(4,0))
+
+        dim_label(right, "GENRE QUERIES").pack(anchor="w", pady=(0,6))
+        self._genres = {}
+        genres = [("Metal", "metal", True), ("Rock", "rock", True),
+                  ("Punk", "punk", True), ("Pop", "pop", True),
+                  ("Alternative", "alternative", False),
+                  ("Electronic", "electronic", False),
+                  ("General", "", True)]
+        gc = card(right)
+        gc.pack(fill="x", pady=(0,12))
+        for name, val, default in genres:
+            var = BooleanVar(value=cfg.get(f"genre_{val}", default))
+            self._genres[val] = var
+            ctk.CTkCheckBox(gc, text=name, variable=var,
+                font=ctk.CTkFont(size=12), checkmark_color="black",
+                fg_color=ACCENT).pack(anchor="w", padx=12, pady=4)
+
+        dim_label(right, "SONGS PER GENRE").pack(anchor="w", pady=(0,3))
+        self._limit_var = StringVar(value=str(cfg.get("scrape_limit", 2000)))
+        entry(right, textvariable=self._limit_var, height=30).pack(fill="x", pady=(0,12))
+
+        dim_label(right, "WORKERS (parallel downloads)").pack(anchor="w", pady=(0,3))
+        self._workers_var = StringVar(value=str(cfg.get("scrape_workers", 16)))
+        entry(right, textvariable=self._workers_var, height=30).pack(fill="x", pady=(0,16))
+
+        self._scrape_btn = btn(right, "📥  Start Scraping", self._scrape,
+            width=240, height=40, accent=True)
+        self._scrape_btn.configure(font=ctk.CTkFont(size=13, weight="bold"))
+        self._scrape_btn.pack(fill="x")
+
+    def _browse_out(self):
+        d = filedialog.askdirectory()
+        if d: self._out_var.set(d); self.cfg["scrape_out"]=d; save_cfg(self.cfg)
+
+    def _scrape(self):
+        if self._running: return
+        genres = [v for v, var in self._genres.items() if var.get()]
+        if not genres: self.log.log("⚠  Select at least one genre."); return
+        out     = self._out_var.get()
+        limit   = self._limit_var.get()
+        workers = self._workers_var.get()
+        self.cfg.update({"scrape_out":out,"scrape_limit":int(limit),"scrape_workers":int(workers)})
+        save_cfg(self.cfg)
+        self.log.clear()
+        self.log.log(f"Starting scrape: {len(genres)} genre(s) × {limit} songs = up to {len(genres)*int(limit)} total\n")
+
+        def run():
+            self._lock()
+            self._scrape_btn.configure(state="disabled", text="⏳  Scraping...")
+            for g in genres:
+                q = g if g else ""
+                label_str = g if g else "general"
+                self.log.log(f"\n{'─'*36}")
+                self.log.log(f"▶  Genre: {label_str} (limit {limit})")
+                args = [script("scraper.py"), "--out", out, "--limit", limit, "--workers", workers]
+                if q: args += ["--query", q]
+                try:
+                    proc = subprocess.Popen([PYTHON_EXE]+args,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    for line in proc.stdout:
+                        if line.strip(): self.log.log(line.rstrip())
+                    proc.wait()
+                except Exception as e:
+                    self.log.log(f"❌ {e}")
+            self.log.log("\n🎉  All genres scraped!")
+            self._scrape_btn.configure(state="normal", text="📥  Start Scraping")
+            self._unlock()
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+# ── PREPROCESS TAB ────────────────────────────────────────────────────────────
+
+class PreprocessTab(BaseTab):
+    def __init__(self, parent, cfg):
+        super().__init__(parent, cfg, "Preprocess", "Convert songs to mel spectrograms for training", "⚙️")
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24)
+
+        left  = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(0,16))
+        right = ctk.CTkFrame(body, fg_color="transparent", width=260)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        label(left, "Output Log", size=13, bold=True).pack(anchor="w", pady=(0,6))
+        self.log = LogBox(left)
+        self.log.pack(fill="both", expand=True)
+
+        label(right, "Preprocess Settings", size=14, bold=True).pack(anchor="w", pady=(0,12))
+
+        dim_label(right, "DATASET FOLDER (from scraper)").pack(anchor="w", pady=(0,3))
+        self._data_var = StringVar(value=cfg.get("scrape_out","./dataset"))
+        self._folder_row(right, self._data_var, self._browse_data)
+
+        dim_label(right, "OUTPUT FOLDER (processed .pt files)").pack(anchor="w", pady=(0,3))
+        self._out_var = StringVar(value=cfg.get("preprocess_out","./processed"))
+        self._folder_row(right, self._out_var, self._browse_out)
+
+        # Info card
+        ic = card(right)
+        ic.pack(fill="x", pady=(0,16))
+        for line in ["• Skips already-processed songs","• ~1-2 hrs for 5k songs","• Creates .pt tensor files"]:
+            dim_label(ic, line).pack(anchor="w", padx=12, pady=3)
+
+        self._btn = btn(right, "⚙️  Start Preprocessing", self._run,
+            width=240, height=40, accent=True)
+        self._btn.configure(font=ctk.CTkFont(size=13, weight="bold"))
+        self._btn.pack(fill="x")
+
+    def _folder_row(self, parent, var, cmd):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(0,12))
+        entry(row, textvariable=var, height=30).pack(side="left", fill="x", expand=True)
+        btn(row, "📁", cmd, width=30, height=30).pack(side="right", padx=(4,0))
+
+    def _browse_data(self):
+        d = filedialog.askdirectory()
+        if d: self._data_var.set(d)
+
+    def _browse_out(self):
+        d = filedialog.askdirectory()
+        if d: self._out_var.set(d); self.cfg["preprocess_out"]=d; save_cfg(self.cfg)
+
+    def _run(self):
+        if self._running: return
+        self.log.clear()
+        self._btn.configure(state="disabled", text="⏳  Processing...")
+        run_script([script("preprocess_dataset.py"),
+                    "--data", self._data_var.get(),
+                    "--out",  self._out_var.get()],
+            self.log,
+            on_done=lambda: self._btn.configure(state="normal", text="⚙️  Start Preprocessing"))
+        self._lock()
+
+
+# ── TRAIN TAB ─────────────────────────────────────────────────────────────────
+
+class TrainTab(BaseTab):
+    def __init__(self, parent, cfg):
+        super().__init__(parent, cfg, "Train Model", "Train ChartNet v3 on your dataset", "🧠")
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24)
+
+        left  = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(0,16))
+        right = ctk.CTkFrame(body, fg_color="transparent", width=260)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        label(left, "Training Log", size=13, bold=True).pack(anchor="w", pady=(0,6))
+        self.log = LogBox(left)
+        self.log.pack(fill="both", expand=True)
+
+        label(right, "Train Settings", size=14, bold=True).pack(anchor="w", pady=(0,12))
+
+        # Paths
+        dim_label(right, "PROCESSED DATA FOLDER").pack(anchor="w", pady=(0,3))
+        self._data_var = StringVar(value=cfg.get("preprocess_out","./processed"))
+        self._folder_row(right, self._data_var, lambda: self._browse(self._data_var))
+
+        dim_label(right, "CHECKPOINT OUTPUT FOLDER").pack(anchor="w", pady=(0,3))
+        self._ckpt_var = StringVar(value=cfg.get("train_ckpt","./checkpoints"))
+        self._folder_row(right, self._ckpt_var, lambda: self._browse(self._ckpt_var))
+
+        dim_label(right, "RESUME FROM CHECKPOINT (optional)").pack(anchor="w", pady=(0,3))
+        self._resume_var = StringVar(value="")
+        rrow = ctk.CTkFrame(right, fg_color="transparent")
+        rrow.pack(fill="x", pady=(0,12))
+        entry(rrow, textvariable=self._resume_var, placeholder="Leave empty for fresh start", height=30).pack(side="left", fill="x", expand=True)
+        btn(rrow, "📁", lambda: self._browse_file(self._resume_var), width=30, height=30).pack(side="right", padx=(4,0))
+
+        # Hyperparams grid
+        hc = card(right)
+        hc.pack(fill="x", pady=(0,12))
+        params = [
+            ("Epochs",       "train_epochs",  "160"),
+            ("Batch Size",   "train_batch",   "600"),
+            ("Workers",      "train_workers", "16"),
+            ("Learning Rate","train_lr",      "2e-4"),
+        ]
+        self._param_vars = {}
+        for pname, key, default in params:
+            pr = ctk.CTkFrame(hc, fg_color="transparent")
+            pr.pack(fill="x", padx=10, pady=4)
+            dim_label(pr, pname).pack(side="left")
+            var = StringVar(value=str(cfg.get(key, default)))
+            self._param_vars[key] = var
+            entry(pr, textvariable=var, width=80, height=26).pack(side="right")
+
+        # Flags
+        self._reset_best = BooleanVar(value=False)
+        ctk.CTkCheckBox(right, text="Reset best F1 (new dataset)", variable=self._reset_best,
+            font=ctk.CTkFont(size=12), checkmark_color="black",
+            fg_color=ACCENT).pack(anchor="w", pady=(0,12))
+
+        # Buttons
+        brow = ctk.CTkFrame(right, fg_color="transparent")
+        brow.pack(fill="x")
+        self._train_btn = btn(brow, "🧠  Start Training", self._train,
+            width=165, height=40, accent=True)
+        self._train_btn.configure(font=ctk.CTkFont(size=13, weight="bold"))
+        self._train_btn.pack(side="left", padx=(0,6))
+        btn(brow, "⏹ Stop", self._stop, width=65, height=40, danger=True).pack(side="left")
+
+        self._proc = None
+
+    def _folder_row(self, parent, var, cmd):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(0,10))
+        entry(row, textvariable=var, height=30).pack(side="left", fill="x", expand=True)
+        btn(row, "📁", cmd, width=30, height=30).pack(side="right", padx=(4,0))
+
+    def _browse(self, var):
+        d = filedialog.askdirectory()
+        if d: var.set(d)
+
+    def _browse_file(self, var):
+        f = filedialog.askopenfilename(filetypes=[("Checkpoint","*.pt"),("All","*.*")])
+        if f: var.set(f)
+
+    def _train(self):
+        if self._running: return
+        self.log.clear()
+        args = [script("train_chartnet.py"),
+                "--data",    self._data_var.get(),
+                "--out",     self._ckpt_var.get(),
+                "--epochs",  self._param_vars["train_epochs"].get(),
+                "--batch",   self._param_vars["train_batch"].get(),
+                "--workers", self._param_vars["train_workers"].get(),
+                "--lr",      self._param_vars["train_lr"].get()]
+        if self._resume_var.get(): args += ["--resume", self._resume_var.get()]
+        if self._reset_best.get(): args.append("--reset-best")
+
+        for k in ["train_epochs","train_batch","train_workers","train_lr"]:
+            self.cfg[k] = self._param_vars[k].get()
+        save_cfg(self.cfg)
+
+        self._train_btn.configure(state="disabled", text="⏳  Training...")
+        self._lock()
+
+        def run():
+            self.log.log("$ " + " ".join(str(a) for a in args[1:]))
             try:
-                proc = subprocess.Popen(cmd, cwd=str(Path(__file__).parent),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1)
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        self._log(f"  {line}")
-                proc.wait()
-                self._log("✅  Done!" if proc.returncode == 0 else f"❌  Failed (exit {proc.returncode})")
+                self._proc = subprocess.Popen([PYTHON_EXE]+args,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                for line in self._proc.stdout:
+                    if line.strip(): self.log.log(line.rstrip())
+                self._proc.wait()
+                self.log.log("\n✅ Training complete!" if self._proc.returncode==0 else "❌ Training stopped")
             except Exception as e:
-                self._log(f"❌  Error: {e}")
+                self.log.log(f"❌ {e}")
+            self._train_btn.configure(state="normal", text="🧠  Start Training")
+            self._unlock()
 
-            self.after(0, lambda v=(i+1)/total: self.progress.set(v))
+        threading.Thread(target=run, daemon=True).start()
 
-        self._log(f"\n🎸  All done! Output → {out}")
-        self.after(0, self._on_done)
-
-    def _on_done(self):
-        self.running = False
-        self.gen_btn.configure(state="normal", text="⚡  Generate Charts")
-        self.status_label.configure(text=f"Done! {len(self.songs)} chart(s) generated")
-        self.progress.set(1)
+    def _stop(self):
+        if self._proc:
+            self._proc.terminate()
+            self.log.log("\n⏹  Training stopped by user.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = ChartGenApp()
+    app = App()
     app.mainloop()
