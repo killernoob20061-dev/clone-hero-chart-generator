@@ -11,9 +11,10 @@ from tkinter import filedialog, StringVar, BooleanVar, IntVar
 import tkinter as tk
 from PIL import Image, ImageTk, ImageFilter
 
-# ── Path resolution (works both as .py and frozen .exe) ───────────────────────
+# ── Path resolution (works as .py, PyInstaller .exe, and Nuitka .exe) ─────────
 if getattr(sys, 'frozen', False):
-    APP_DIR    = Path(sys._MEIPASS)          # bundled scripts live here
+    # PyInstaller extracts to sys._MEIPASS; Nuitka standalone exe sits in its folder
+    APP_DIR = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
     PYTHON_EXE = shutil.which('python') or shutil.which('python3') or 'python'
 else:
     APP_DIR    = Path(__file__).parent
