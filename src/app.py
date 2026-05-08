@@ -359,47 +359,64 @@ class GenerateTab(BaseTab):
     def __init__(self, parent, cfg):
         super().__init__(parent, cfg, "Generate Charts", "MP3 → Clone Hero .chart files", "🎸")
 
-        # Bottom bar must be packed BEFORE the body so pack reserves space for it first
+        # Bottom bar packed FIRST so expand=True on body doesn't eat its space
         self._build_bottom()
 
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=24, pady=0)
+        body.pack(fill="both", expand=True, padx=20, pady=(0,8))
 
+        # ── Left column ──────────────────────────────────────────────────────
         left = ctk.CTkFrame(body, fg_color="transparent")
-        left.pack(side="left", fill="both", expand=True, padx=(0,16))
-        right = ctk.CTkFrame(body, fg_color="transparent", width=240)
-        right.pack(side="right", fill="y")
-        right.pack_propagate(False)
+        left.pack(side="left", fill="both", expand=True, padx=(0,14))
 
         # Drop zone
-        drop = card(left, height=100, border_width=2, border_color="#2a2a2a")
-        drop.pack(fill="x", pady=(0,12))
+        drop = card(left, height=90, border_width=2, border_color="#2a2a2a")
+        drop.pack(fill="x", pady=(0,10))
         drop.pack_propagate(False)
         drop.bind("<Button-1>", lambda e: self._browse())
         drop.bind("<Enter>",    lambda e: drop.configure(border_color=ACCENT))
         drop.bind("<Leave>",    lambda e: drop.configure(border_color="#2a2a2a"))
-        inner = ctk.CTkFrame(drop, fg_color="transparent")
-        inner.place(relx=.5, rely=.5, anchor="center")
-        label(inner, "🎵", size=26).pack()
-        label(inner, "Click to add MP3 / audio files", size=13, bold=True).pack()
-        dim_label(inner, "Supports batch — multiple songs at once").pack()
-        for w in inner.winfo_children(): w.bind("<Button-1>", lambda e: self._browse())
+        di = ctk.CTkFrame(drop, fg_color="transparent")
+        di.place(relx=.5, rely=.5, anchor="center")
+        label(di, "🎵  Click to add MP3 / audio files", size=13, bold=True).pack()
+        dim_label(di, "Supports batch — multiple files at once").pack(pady=(2,0))
+        for w in di.winfo_children(): w.bind("<Button-1>", lambda e: self._browse())
 
-        # Song list
+        # Songs header
         sh = ctk.CTkFrame(left, fg_color="transparent")
-        sh.pack(fill="x", pady=(0,6))
-        label(sh, "Songs", size=13, bold=True).pack(side="left")
-        btn(sh, "Clear all", self._clear, width=70, height=26).pack(side="right")
+        sh.pack(fill="x", pady=(0,4))
+        label(sh, "Songs", size=12, bold=True).pack(side="left")
+        btn(sh, "Clear all", self._clear, width=70, height=24).pack(side="right")
 
-        self.song_list = ctk.CTkScrollableFrame(left, fg_color=BG_CARD, corner_radius=8, height=140)
-        self.song_list.pack(fill="x", pady=(0,12))
+        self.song_list = ctk.CTkScrollableFrame(left, fg_color=BG_CARD, corner_radius=8, height=120)
+        self.song_list.pack(fill="x", pady=(0,10))
         self._songs = []
         self._refresh_list()
 
         # Log
-        label(left, "Output Log", size=13, bold=True).pack(anchor="w", pady=(0,6))
-        self.log = LogBox(left, height=160)
+        label(left, "Output Log", size=12, bold=True).pack(anchor="w", pady=(0,4))
+        self.log = LogBox(left)
         self.log.pack(fill="both", expand=True)
+
+        # ── Right column — Settings ───────────────────────────────────────────
+        right = ctk.CTkFrame(body, fg_color="transparent", width=230)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        label(right, "Settings", size=13, bold=True).pack(anchor="w", pady=(0,10))
+
+        self._out_var   = self._folder_row(right, "Output Folder",
+            cfg.get("gen_out", str(Path.home()/"Desktop"/"Charts")), self._browse_out)
+        self._model_var = self._file_row(right, "Neural Model (optional)",
+            cfg.get("model_path",""), "*.pt", self._browse_model)
+        self._frets_var, self._fret_btns = self._fret_row(right, cfg.get("frets","0,1,2,3,4"))
+
+        dim_label(right, "OPTIONS").pack(anchor="w", pady=(6,4))
+        self._lyrics_var = BooleanVar(value=cfg.get("lyrics", False))
+        ctk.CTkSwitch(right, text="Whisper Lyrics (slow)",
+            variable=self._lyrics_var,
+            font=ctk.CTkFont(size=12),
+            progress_color=ACCENT).pack(anchor="w")
 
     def _build_bottom(self):
         bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=76)
