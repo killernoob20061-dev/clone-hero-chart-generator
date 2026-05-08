@@ -19,3 +19,7 @@ requests
 
 # Optional — better beat tracking (recommended)
 # madmom
+
+# Better pitch detection — polyphonic, much more accurate than pyin
+basic-pitch
+soundfile

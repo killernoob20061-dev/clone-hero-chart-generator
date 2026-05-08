@@ -90,10 +90,15 @@ def get_demucs():
         cache = pathlib.Path.home() / '.cache' / 'torch' / 'hub' / 'checkpoints'
         cached = any(str(f).endswith('.th') for f in cache.glob('*')) if cache.exists() else False
         if not cached:
-            print('  Downloading Demucs model (~200MB) — first run only, please wait...')
+            print('  Downloading Demucs model (~400MB) — first run only, please wait...')
         else:
-            print('  Loading Demucs htdemucs...')
-        _demucs_model = get_model('htdemucs')
+            print('  Loading Demucs htdemucs_ft...')
+        # htdemucs_ft = fine-tuned version, better guitar/bass separation
+        try:
+            _demucs_model = get_model('htdemucs_ft')
+        except Exception:
+            print('  htdemucs_ft not available, falling back to htdemucs...')
+            _demucs_model = get_model('htdemucs')
         _demucs_model.eval()
         print('  Demucs loaded.')
     return _demucs_model
@@ -296,10 +301,51 @@ def build_bass_root_map(y_bass, sr, tps):
 
     return bass_at
 
-# ── Pitch map (pyin) ──────────────────────────────────────────────────────────
+# ── Pitch map (basic-pitch polyphonic, pyin fallback) ─────────────────────────
 
-def build_pitch_map(y_guit, sr, tps):
-    print('  pyin pitch analysis...')
+def _pitch_map_basic_pitch(y_guit, sr, tps):
+    """Use Spotify basic-pitch for polyphonic note detection — much more accurate."""
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    import tensorflow as tf
+    print('  basic-pitch polyphonic pitch analysis...')
+    # basic-pitch needs a file path, write to temp wav
+    import soundfile as sf, tempfile, os
+    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    tmp.close()
+    try:
+        sf.write(tmp.name, y_guit, sr)
+        model_out, midi_data, note_events = predict(tmp.name)
+        # note_events: list of (start_time, end_time, pitch_midi, amplitude, pitch_bends)
+        # Build a pitch timeline: for each centisecond, dominant midi note
+        dur = len(y_guit) / sr
+        resolution = 0.01  # 10ms bins
+        n_bins = int(dur / resolution) + 1
+        midi_timeline = np.zeros(n_bins)
+        for ev in note_events:
+            start_bin = int(ev[0] / resolution)
+            end_bin   = int(ev[1] / resolution)
+            pitch     = ev[2]
+            for b in range(start_bin, min(end_bin, n_bins)):
+                if midi_timeline[b] == 0 or ev[3] > 0.5:
+                    midi_timeline[b] = pitch
+        midi_s = sp_medfilt(midi_timeline, size=5)
+        vm = midi_s[midi_s > 0]
+        p33, p66 = (float(np.percentile(vm,33)), float(np.percentile(vm,66))) if len(vm)>10 else (55.0,67.0)
+        print(f'  basic-pitch p33={p33:.1f} p66={p66:.1f}  notes={len(note_events)}')
+        def fret_at(tick):
+            t_s = tick / tps
+            b   = max(0, min(int(t_s / resolution), n_bins-1))
+            m   = midi_s[b]
+            if m > 0: return 0 if m < p33 else (1 if m < p66 else 2)
+            return 1  # fallback centre fret
+        return fret_at
+    finally:
+        try: os.unlink(tmp.name)
+        except Exception: pass
+
+def _pitch_map_pyin(y_guit, sr, tps):
+    """Fallback pyin-based monophonic pitch map."""
     hop = 256
     f0, voiced, vprob = librosa.pyin(
         y_guit, sr=sr,
@@ -312,18 +358,25 @@ def build_pitch_map(y_guit, sr, tps):
     midi_s = np.where(midi > 0, midi_s, 0.0)
     vm = midi_s[midi_s>0]
     p33, p66 = (float(np.percentile(vm,33)), float(np.percentile(vm,66))) if len(vm)>10 else (55.0,67.0)
-    print(f'  Pitch p33={p33:.1f} p66={p66:.1f}  voiced={len(vm)} frames')
+    print(f'  pyin p33={p33:.1f} p66={p66:.1f}  voiced={len(vm)} frames')
     S  = np.abs(librosa.stft(y_guit, hop_length=hop, n_fft=2048))
     ff = librosa.fft_frequencies(sr=sr)
     le = S[ff<=300].sum(0); me = S[(ff>300)&(ff<=1500)].sum(0); he = S[ff>1500].sum(0)
     def fret_at(tick):
-        t_s   = tick/tps
+        t_s   = tick / tps
         frame = max(0, min(int(round(t_s*sr/hop)), len(midi_s)-1))
         m     = midi_s[frame]
-        if m > 0: return 0 if m<p33 else (1 if m<p66 else 2)
+        if m > 0: return 0 if m < p33 else (1 if m < p66 else 2)
         sf = min(int(librosa.time_to_frames(t_s, sr=sr, hop_length=hop)), le.shape[0]-1)
         return int(np.argmax([le[sf], me[sf], he[sf]]))
     return fret_at
+
+def build_pitch_map(y_guit, sr, tps):
+    try:
+        return _pitch_map_basic_pitch(y_guit, sr, tps)
+    except Exception as e:
+        print(f'  basic-pitch unavailable ({e}), falling back to pyin...')
+        return _pitch_map_pyin(y_guit, sr, tps)
 
 # ── Guitar solo detection ─────────────────────────────────────────────────────
 
@@ -343,12 +396,31 @@ def detect_solo_regions(y_guit, y_full, sr, beat_times, tps, bpm):
     print('  Detecting guitar solo regions...')
     hop = 512
 
-    # 1. Voiced probability from pyin
-    _, voiced, vprob = librosa.pyin(
-        y_guit, sr=sr,
-        fmin=librosa.note_to_hz('E2'), fmax=librosa.note_to_hz('E6'),
-        frame_length=2048, hop_length=hop, fill_na=0.0)
-    vprob_s = uniform_filter1d(vprob.astype(float), size=20)
+    # 1. Voiced probability — try basic-pitch onset density, fall back to pyin
+    try:
+        from basic_pitch.inference import predict
+        import soundfile as sf, tempfile, os as _os
+        _tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        _tmp.close()
+        sf.write(_tmp.name, y_guit, sr)
+        _model_out, _, _note_events = predict(_tmp.name)
+        try: _os.unlink(_tmp.name)
+        except Exception: pass
+        # Build voiced probability from note density
+        dur_frames = int(len(y_guit) / hop) + 1
+        vprob = np.zeros(dur_frames)
+        for ev in _note_events:
+            sf_ = int(ev[0] * sr / hop)
+            ef_ = int(ev[1] * sr / hop)
+            for b in range(sf_, min(ef_, dur_frames)):
+                vprob[b] = max(vprob[b], float(ev[3]))
+    except Exception:
+        _, voiced, vprob = librosa.pyin(
+            y_guit, sr=sr,
+            fmin=librosa.note_to_hz('E2'), fmax=librosa.note_to_hz('E6'),
+            frame_length=2048, hop_length=hop, fill_na=0.0)
+        vprob = vprob.astype(float)
+    vprob_s = uniform_filter1d(vprob, size=20)
 
     # 2. Spectral centroid of guitar stem
     cent = librosa.feature.spectral_centroid(y=y_guit, sr=sr, hop_length=hop)[0]
