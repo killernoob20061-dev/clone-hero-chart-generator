@@ -1,0 +1,21 @@
+# Core audio / ML
+librosa
+numpy
+torch
+demucs
+openai-whisper
+scipy
+scikit-learn
+
+# Chart output / metadata
+mutagen
+Pillow
+
+# Training utilities
+tqdm
+
+# Scraper
+requests
+
+# Optional — better beat tracking (recommended)
+# madmom
