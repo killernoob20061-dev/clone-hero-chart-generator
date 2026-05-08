@@ -356,6 +356,9 @@ class GenerateTab(BaseTab):
     def __init__(self, parent, cfg):
         super().__init__(parent, cfg, "Generate Charts", "MP3 → Clone Hero .chart files", "🎸")
 
+        # Bottom bar must be packed BEFORE the body so pack reserves space for it first
+        self._build_bottom()
+
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=0)
 
@@ -394,21 +397,6 @@ class GenerateTab(BaseTab):
         label(left, "Output Log", size=13, bold=True).pack(anchor="w", pady=(0,6))
         self.log = LogBox(left, height=160)
         self.log.pack(fill="both", expand=True)
-
-        # Settings panel (right)
-        label(right, "Settings", size=14, bold=True).pack(anchor="w", pady=(0,12))
-        self._out_var   = self._folder_row(right, "Output Folder",
-            cfg.get("gen_out", str(Path.home()/"Desktop"/"Charts")), self._browse_out)
-        self._model_var = self._file_row(right, "Neural Model (optional)",
-            cfg.get("model_path",""), "*.pt", self._browse_model)
-        self._frets_var, self._fret_btns = self._fret_row(right, cfg.get("frets","0,1,2,3,4"))
-        dim_label(right, "OPTIONS").pack(anchor="w", pady=(8,4))
-        self._lyrics_var = BooleanVar(value=cfg.get("lyrics", False))
-        ctk.CTkSwitch(right, text="Whisper Lyrics (slow)", variable=self._lyrics_var,
-            font=ctk.CTkFont(size=12), progress_color=ACCENT).pack(anchor="w")
-
-        # Bottom bar
-        self._build_bottom()
 
     def _build_bottom(self):
         bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=76)
