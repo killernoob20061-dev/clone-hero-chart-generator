@@ -16,7 +16,11 @@ def _find_python():
     # 1. Already known (running as .py)
     if not getattr(sys, 'frozen', False):
         return sys.executable
-    # 2. PATH lookup
+    # 2. py launcher — always at C:\Windows\py.exe, works even with stripped PATH
+    py = shutil.which('py') or r'C:\Windows\py.exe'
+    if Path(py).exists():
+        return py
+    # 3. PATH lookup
     found = shutil.which('python') or shutil.which('python3')
     if found:
         return found
@@ -563,16 +567,19 @@ class GenerateTab(BaseTab):
         songs = list(self._songs)
 
         def run():
+            self.log.log(f"Python: {PYTHON_EXE}")
+            self.log.log(f"Script: {script('chartgen.py')}")
             for i, song in enumerate(songs):
                 self.status_lbl.configure(text=f"Processing {i+1}/{len(songs)}: {Path(song).name}")
-                cmd = [script("chartgen.py"), "--out", self._out_var.get(),
-                       "--frets", self._frets_var.get()]
-                if not self._lyrics_var.get(): cmd.append("--no-lyrics")
-                if self._model_var.get(): cmd += ["--model", self._model_var.get()]
-                cmd.append(song)
+                args = [PYTHON_EXE, script("chartgen.py"),
+                        "--out", self._out_var.get(),
+                        "--frets", self._frets_var.get()]
+                if not self._lyrics_var.get(): args.append("--no-lyrics")
+                if self._model_var.get(): args += ["--model", self._model_var.get()]
+                args.append(song)
                 self.log.log(f"\n[{i+1}/{len(songs)}] {Path(song).name}")
                 try:
-                    proc = subprocess.Popen([PYTHON_EXE]+[script("chartgen.py")]+cmd[1:],
+                    proc = subprocess.Popen(args,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
                     for line in proc.stdout:
                         if line.strip(): self.log.log("  " + line.rstrip())
