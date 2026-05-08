@@ -6,13 +6,15 @@ Automatically generates Clone Hero `.chart` files from MP3s — with guitar solo
 
 The easiest way to use this project is the **ChartGen.exe** desktop app — no command line needed.
 
-**Download:** `release/ChartGen.exe`
+**Download:** `release/ChartGen/ChartGen.exe`
 
 **Or build it yourself:**
 ```bash
-# Just double-click build.bat — installs everything and builds the exe automatically
+# Just double-click build.bat — installs everything and builds automatically
 build.bat
 ```
+
+> Built with **Nuitka** (Python → native machine code) — 0 antivirus detections on VirusTotal.
 
 ### App Features
 
