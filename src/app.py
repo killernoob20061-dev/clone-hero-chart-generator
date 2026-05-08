@@ -3,7 +3,7 @@ Clone Hero Chart Generator Suite — Full GUI App
 Tabs: Generate · Scrape · Preprocess · Train
 """
 
-import sys, os, json, threading, subprocess, queue, shutil, tempfile
+import sys, os, json, threading, subprocess, queue, shutil, tempfile, winreg
 from pathlib import Path
 
 import customtkinter as ctk
@@ -11,14 +11,49 @@ from tkinter import filedialog, StringVar, BooleanVar, IntVar
 import tkinter as tk
 from PIL import Image, ImageTk, ImageFilter
 
+# ── Find Python executable (robust — works even when PATH is stripped) ─────────
+def _find_python():
+    # 1. Already known (running as .py)
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    # 2. PATH lookup
+    found = shutil.which('python') or shutil.which('python3')
+    if found:
+        return found
+    # 3. Windows registry — HKCU and HKLM Python installs
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for base in (r'SOFTWARE\Python\PythonCore', r'SOFTWARE\WOW6432Node\Python\PythonCore'):
+            try:
+                with winreg.OpenKey(hive, base) as core:
+                    for i in range(winreg.QueryInfoKey(core)[0]):
+                        ver = winreg.EnumKey(core, i)
+                        try:
+                            with winreg.OpenKey(core, rf'{ver}\InstallPath') as ip:
+                                path = winreg.QueryValueEx(ip, 'ExecutablePath')[0]
+                                if path and Path(path).exists():
+                                    return path
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    # 4. Common install locations
+    for candidate in [
+        r'C:\Python310\python.exe', r'C:\Python311\python.exe', r'C:\Python312\python.exe',
+        Path.home() / 'AppData/Local/Programs/Python/Python310/python.exe',
+        Path.home() / 'AppData/Local/Programs/Python/Python311/python.exe',
+        Path.home() / 'AppData/Local/Programs/Python/Python312/python.exe',
+    ]:
+        if Path(candidate).exists():
+            return str(candidate)
+    return 'python'  # last resort
+
 # ── Path resolution (works as .py, PyInstaller .exe, and Nuitka .exe) ─────────
 if getattr(sys, 'frozen', False):
-    # PyInstaller extracts to sys._MEIPASS; Nuitka standalone exe sits in its folder
     APP_DIR = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
-    PYTHON_EXE = shutil.which('python') or shutil.which('python3') or 'python'
 else:
-    APP_DIR    = Path(__file__).parent
-    PYTHON_EXE = sys.executable
+    APP_DIR = Path(__file__).parent
+
+PYTHON_EXE = _find_python()
 
 def script(name):
     return str(APP_DIR / name)
