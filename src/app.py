@@ -124,7 +124,7 @@ def run_script(args, logbox, on_done=None, on_start=None):
     """Run a python script in a background thread, streaming output to logbox."""
     def _run():
         if on_start: on_start()
-        cmd = [PYTHON_EXE] + args
+        cmd = [PYTHON_EXE, "-u"] + args
         logbox.log("$ " + " ".join(str(a) for a in args))
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -548,7 +548,7 @@ class GenerateTab(BaseTab):
             self.log.log(f"Script: {script('chartgen.py')}")
             for i, song in enumerate(songs):
                 self.status_lbl.configure(text=f"Processing {i+1}/{len(songs)}: {Path(song).name}")
-                args = [py, script("chartgen.py"),
+                args = [py, "-u", script("chartgen.py"),
                         "--out", self._out_var.get(),
                         "--frets", self._frets_var.get()]
                 if not self._lyrics_var.get(): args.append("--no-lyrics")
@@ -657,7 +657,7 @@ class ScrapeTab(BaseTab):
                 args = [script("scraper.py"), "--out", out, "--limit", limit, "--workers", workers]
                 if q: args += ["--query", q]
                 try:
-                    proc = subprocess.Popen([PYTHON_EXE]+args,
+                    proc = subprocess.Popen([PYTHON_EXE, "-u"]+args,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
                     for line in proc.stdout:
                         if line.strip(): self.log.log(line.rstrip())
@@ -846,7 +846,7 @@ class TrainTab(BaseTab):
         def run():
             self.log.log("$ " + " ".join(str(a) for a in args[1:]))
             try:
-                self._proc = subprocess.Popen([PYTHON_EXE]+args,
+                self._proc = subprocess.Popen([PYTHON_EXE, "-u"]+args,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
                 for line in self._proc.stdout:
                     if line.strip(): self.log.log(line.rstrip())
