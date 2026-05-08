@@ -11,75 +11,13 @@ from tkinter import filedialog, StringVar, BooleanVar, IntVar
 import tkinter as tk
 from PIL import Image, ImageTk, ImageFilter
 
-# ── Find Python executable (robust — works even when PATH is stripped) ─────────
-def _find_python():
-    # Running as plain .py — use current interpreter
-    if not getattr(sys, 'frozen', False):
-        return sys.executable
-
-    app_dir = Path(sys.executable).parent
-
-    def _ok(p):
-        """Valid only if the file exists AND is NOT inside our own app folder."""
-        p = Path(str(p))
-        if not p.exists():
-            return False
-        try:
-            # Resolve both to canonical long paths — Nuitka uses 8.3 short paths
-            # (MRSCHN~1, DOWNLO~1) which won't match app_dir's long path otherwise
-            Path(os.path.realpath(str(p))).relative_to(
-                Path(os.path.realpath(str(app_dir))))
-            return False  # inside app folder — Nuitka's own python, skip it
-        except ValueError:
-            return True
-
-    # 1. Windows py launcher — lives in System32, never in app folder
-    if _ok(r'C:\Windows\py.exe'):
-        return r'C:\Windows\py.exe'
-
-    # 2. Windows registry (newest version first)
-    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-        for base in (r'SOFTWARE\Python\PythonCore', r'SOFTWARE\WOW6432Node\Python\PythonCore'):
-            try:
-                with winreg.OpenKey(hive, base) as core:
-                    versions = [winreg.EnumKey(core, i)
-                                for i in range(winreg.QueryInfoKey(core)[0])]
-                    for ver in sorted(versions, reverse=True):
-                        try:
-                            with winreg.OpenKey(core, rf'{ver}\InstallPath') as ip:
-                                path = winreg.QueryValueEx(ip, 'ExecutablePath')[0]
-                                if _ok(path):
-                                    return str(path)
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-
-    # 3. Common install locations (newest first)
-    for candidate in [
-        Path.home() / 'AppData/Local/Programs/Python/Python312/python.exe',
-        Path.home() / 'AppData/Local/Programs/Python/Python311/python.exe',
-        Path.home() / 'AppData/Local/Programs/Python/Python310/python.exe',
-        r'C:\Python312\python.exe', r'C:\Python311\python.exe', r'C:\Python310\python.exe',
-    ]:
-        if _ok(candidate):
-            return str(candidate)
-
-    # 4. PATH lookup last — filter out anything inside our folder
-    for name in ('python', 'python3'):
-        found = shutil.which(name)
-        if found and _ok(found):
-            return found
-
-    return 'python'
-
 # ── Path resolution (works as .py, PyInstaller .exe, and Nuitka .exe) ─────────
 if getattr(sys, 'frozen', False):
-    APP_DIR = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
+    APP_DIR    = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent
+    PYTHON_EXE = None   # loaded from config at runtime — user must set it once
 else:
-    APP_DIR = Path(__file__).parent
-
-PYTHON_EXE = _find_python()
+    APP_DIR    = Path(__file__).parent
+    PYTHON_EXE = sys.executable
 
 def script(name):
     return str(APP_DIR / name)
@@ -467,6 +405,9 @@ class GenerateTab(BaseTab):
 
         label(right, "Settings", size=13, bold=True).pack(anchor="w", pady=(0,10))
 
+        self._python_var = self._file_row(right, "Python Executable",
+            cfg.get("python_exe", ""), "*.exe", self._browse_python,
+            placeholder="Browse to your python.exe")
         self._out_var   = self._folder_row(right, "Output Folder",
             cfg.get("gen_out", str(Path.home()/"Desktop"/"Charts")), self._browse_out)
         self._model_var = self._file_row(right, "Neural Model (optional)",
@@ -509,12 +450,12 @@ class GenerateTab(BaseTab):
         btn(row, "📁", browse_cmd, width=30, height=30).pack(side="right", padx=(4,0))
         return var
 
-    def _file_row(self, parent, title, default, ext, browse_cmd):
+    def _file_row(self, parent, title, default, ext, browse_cmd, placeholder="Not set"):
         dim_label(parent, title.upper()).pack(anchor="w", pady=(0,3))
         var = StringVar(value=default)
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=(0,10))
-        entry(row, textvariable=var, placeholder="Not set", height=30).pack(side="left", fill="x", expand=True)
+        entry(row, textvariable=var, placeholder=placeholder, height=30).pack(side="left", fill="x", expand=True)
         btn(row, "📁", browse_cmd, width=30, height=30).pack(side="right", padx=(4,0))
         return var
 
@@ -568,6 +509,11 @@ class GenerateTab(BaseTab):
 
     def _clear(self): self._songs.clear(); self._refresh_list()
 
+    def _browse_python(self):
+        f = filedialog.askopenfilename(title="Select python.exe",
+            filetypes=[("Python","python.exe"),("Executable","*.exe"),("All","*.*")])
+        if f: self._python_var.set(f); self.cfg["python_exe"]=f; save_cfg(self.cfg)
+
     def _browse_out(self):
         d = filedialog.askdirectory()
         if d: self._out_var.set(d); self.cfg["gen_out"]=d; save_cfg(self.cfg)
@@ -589,11 +535,20 @@ class GenerateTab(BaseTab):
         songs = list(self._songs)
 
         def run():
-            self.log.log(f"Python: {PYTHON_EXE}")
+            # Use user-set python, fall back to global PYTHON_EXE
+            py = self._python_var.get().strip() or PYTHON_EXE or 'python'
+            if not py or not Path(py).exists():
+                self.log.log(f"❌ Python not found: '{py}'")
+                self.log.log("   ➜ Click 📁 next to 'Python Executable' and browse to your python.exe")
+                self.log.log(f"      (usually C:\\Users\\YOU\\AppData\\Local\\Programs\\Python\\Python310\\python.exe)")
+                self.gen_btn.configure(state="normal", text="⚡  Generate Charts")
+                self._unlock()
+                return
+            self.log.log(f"Python: {py}")
             self.log.log(f"Script: {script('chartgen.py')}")
             for i, song in enumerate(songs):
                 self.status_lbl.configure(text=f"Processing {i+1}/{len(songs)}: {Path(song).name}")
-                args = [PYTHON_EXE, script("chartgen.py"),
+                args = [py, script("chartgen.py"),
                         "--out", self._out_var.get(),
                         "--frets", self._frets_var.get()]
                 if not self._lyrics_var.get(): args.append("--no-lyrics")
