@@ -35,12 +35,12 @@ TEXT_DIM = "#666666"
 TEXT_MED = "#999999"
 
 THEMES = {
-    "Green (Default)": {"accent": "#1DB954", "bg": "#0d0d0d", "card": "#161616", "side": "#111111"},
-    "Blue Steel":      {"accent": "#3b82f6", "bg": "#0a0e1a", "card": "#111827", "side": "#0d1117"},
-    "Purple Haze":     {"accent": "#a855f7", "bg": "#0d0a1a", "card": "#1a1428", "side": "#110e1a"},
-    "Fire Red":        {"accent": "#ef4444", "bg": "#120a0a", "card": "#1c1010", "side": "#110d0d"},
-    "Gold Rush":       {"accent": "#f59e0b", "bg": "#111009", "card": "#1c1a10", "side": "#110f09"},
-    "Ice White":       {"accent": "#e2e8f0", "bg": "#0f0f0f", "card": "#1a1a1a", "side": "#141414"},
+    "Green (Default)": {"accent": "#1DB954", "bg": "#0d0d0d", "card": "#1a1a1a", "side": "#151515"},
+    "Blue Steel":      {"accent": "#3b82f6", "bg": "#0a0e1a", "card": "#141c2e", "side": "#0f1520"},
+    "Purple Haze":     {"accent": "#a855f7", "bg": "#0d0a1a", "card": "#1e1630", "side": "#181226"},
+    "Fire Red":        {"accent": "#ef4444", "bg": "#0f0808", "card": "#1e1212", "side": "#170e0e"},
+    "Gold Rush":       {"accent": "#f59e0b", "bg": "#0f0e08", "card": "#1e1c10", "side": "#17150a"},
+    "Ice White":       {"accent": "#e2e8f0", "bg": "#0f0f0f", "card": "#1a1a1a", "side": "#161616"},
 }
 
 CONFIG_PATH = Path.home() / ".chartgen_config.json"
@@ -199,7 +199,8 @@ class App(ctk.CTk):
     # ── Build UI ──────────────────────────────────────────────────────────────
     def _build(self):
         # ── Sidebar ───────────────────────────────────────────────────────────
-        self.sidebar = ctk.CTkFrame(self, fg_color=BG_SIDE, corner_radius=0, width=200)
+        self.sidebar = ctk.CTkFrame(self, fg_color=BG_SIDE, corner_radius=0, width=200,
+            border_width=1, border_color="#2a2a2a")
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
