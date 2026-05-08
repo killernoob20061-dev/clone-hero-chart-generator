@@ -15,12 +15,11 @@ if exist src\build   rmdir /s /q src\build
 if exist src\dist    rmdir /s /q src\dist
 if exist src\ChartGen.spec del src\ChartGen.spec
 
-echo [3/3] Building ChartGen.exe...
+echo [3/3] Building ChartGen...
 cd src
-python -m PyInstaller --onefile --windowed --name "ChartGen" ^
+python -m PyInstaller --onedir --windowed --noupx --name "ChartGen" ^
     --collect-all customtkinter ^
     --collect-all PIL ^
-    --icon "chartgen.ico" ^
     --add-data "chartgen.py;." ^
     --add-data "chartmodel.py;." ^
     --add-data "scraper.py;." ^
@@ -31,7 +30,8 @@ python -m PyInstaller --onefile --windowed --name "ChartGen" ^
 if errorlevel 1 (echo. & echo ERROR: Build failed. & cd .. & pause & exit /b 1)
 
 if not exist "..\release" mkdir "..\release"
-move /y dist\ChartGen.exe ..\release\ChartGen.exe
+if exist "..\release\ChartGen" rmdir /s /q "..\release\ChartGen"
+xcopy /e /i /y dist\ChartGen ..\release\ChartGen >nul
 rmdir /s /q build & rmdir /s /q dist & del ChartGen.spec
 cd ..
 

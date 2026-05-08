@@ -43,7 +43,10 @@ THEMES = {
     "Ice White":       {"accent": "#e2e8f0", "bg": "#0f0f0f", "card": "#1a1a1a", "side": "#161616"},
 }
 
-CONFIG_PATH = Path.home() / ".chartgen_config.json"
+_appdata = Path(os.environ.get("APPDATA", Path.home()))
+CONFIG_DIR  = _appdata / "ChartGen"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 def load_cfg():
     try:
